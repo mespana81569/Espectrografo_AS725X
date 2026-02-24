@@ -1,15 +1,15 @@
 #include "SparkFun_AS7265X.h"
 #include <Wire.h>
 #include <Arduino.h>
-#include "esp_littlefs.h"
+#include <LittleFS.h>
 
 struct sensorconfig {
   String lightMode;
   int clockspeed = 400000;
-  int sampleN;
-  String gain;
+  int sampleN;                  // Sensor configuration parameters
+  String gain;            
   String MeasurementeMode;
-  String integrationTime;
+  int integrationCycles;
   bool state;
 };
 
@@ -46,8 +46,8 @@ void setup() {
 void loop() {
   for (int i = 0; i < config.sampleN; i++) {
     eneableSense(config.clockspeed);
-    payload p;
     String *readings = calibration();
+    payload p;
     for(int j = 0; j < 18; j++) {
       p.datos[j] = readings[j].toFloat();
     }
@@ -84,11 +84,11 @@ void eneableSense(int clockspeed) {
   while (!sensor.begin()) {
   }
   config.state = sensor.begin();
-  Wire.setClock(clockspeed);
+  if (!config.state) {Wire.setClock(clockspeed);}
 }
 
 void saveMeasurement(payload d){
-  File file = LittleFs.open(path, "a");
+  File file = LittleFS.open(path, "a");
   if(!file) return;
 
   char buffer[512];
@@ -105,3 +105,4 @@ void saveMeasurement(payload d){
   file.write((const uint8_t*)buffer, pos);
   file.close();
 }
+

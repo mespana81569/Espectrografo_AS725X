@@ -101,7 +101,8 @@ void AS7265xDriver::setSleepMode(bool sleep) {
         _sensor.disableBulb(AS7265x_LED_WHITE);
         _sensor.disableBulb(AS7265x_LED_IR);
         _sensor.disableBulb(AS7265x_LED_UV);
-        //_sensor.setMeasurementMode(AS7265X_MEASUREMENT_MODE_STANDBY);
+        // No true standby in AS7265X — one-shot mode stops converting after one cycle (lowest idle power)
+        _sensor.setMeasurementMode(AS7265X_MEASUREMENT_MODE_6CHAN_ONE_SHOT);
     } else {
         _sensor.setMeasurementMode(static_cast<uint8_t>(_cfg.mode));
     }

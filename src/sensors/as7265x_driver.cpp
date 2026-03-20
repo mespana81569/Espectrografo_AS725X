@@ -101,7 +101,7 @@ void AS7265xDriver::setSleepMode(bool sleep) {
         _sensor.disableBulb(AS7265x_LED_WHITE);
         _sensor.disableBulb(AS7265x_LED_IR);
         _sensor.disableBulb(AS7265x_LED_UV);
-        _sensor.setMeasurementMode(AS7265X_MEASUREMENT_MODE_STANDBY);
+        //_sensor.setMeasurementMode(AS7265X_MEASUREMENT_MODE_STANDBY);
     } else {
         _sensor.setMeasurementMode(static_cast<uint8_t>(_cfg.mode));
     }

@@ -48,7 +48,7 @@ bool SDLogger::saveExperiment(const Experiment& exp) {
         return false;
     }
 
-    File f = SD.open(LOG_FILE, FILE_APPEND);
+    File f = SD.open(LOG_FILE, FILE_WRITE);
     if (!f) {
         Serial.println("[SD] Failed to open log for append");
         return false;
@@ -80,7 +80,7 @@ bool SDLogger::saveExperiment(const Experiment& exp) {
 }
 
 bool SDLogger::writeRow(const char* line) {
-    File f = SD.open(LOG_FILE, FILE_APPEND);
+    File f = SD.open(LOG_FILE, FILE_WRITE);
     if (!f) return false;
     f.print(line);
     f.close();

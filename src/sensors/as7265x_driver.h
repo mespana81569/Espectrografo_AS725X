@@ -22,7 +22,7 @@ struct SensorConfig {
     uint8_t       integrationCycles = 50;   // 2.8ms per cycle, 50 = ~140ms
     MeasurementMode mode         = MeasurementMode::MODE_3;
     uint8_t       ledCurrent     = 12;      // mA: 12, 25, 50, 100
-    bool          ledEnabled     = true;
+    bool          ledEnabled     = false;
 };
 
 class AS7265xDriver {

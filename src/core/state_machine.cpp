@@ -59,24 +59,33 @@ void StateMachine::enterState(SystemState s) {
 }
 
 void StateMachine::exitState(SystemState s) {
-    (void)s;
-}
-
-void StateMachine::tick() {
-    // Handle auto-transitions from running processes
-    switch (_state) {
+    switch (s) {
         case SystemState::CALIBRATION:
-            if (g_calibration.isDone()) {
-                requestTransition(SystemState::WAIT_CONFIRMATION);
-            }
-            break;
-        case SystemState::MEASUREMENT:
-            if (g_measurementEngine.isDone()) {
-                requestTransition(SystemState::VALIDATION);
-            }
+            g_sdLogger.saveCalibration(g_calibration.getData());
+            g_calibration.clearDoneFlag();
             break;
         default:
             break;
+    }
+}
+
+void StateMachine::tick() {
+    // Auto-transitions: only fire once, never overwrite an already-pending request
+    if (!_transitionPending) {
+        switch (_state) {
+            case SystemState::CALIBRATION:
+                if (g_calibration.isDone()) {
+                    requestTransition(SystemState::WAIT_CONFIRMATION);
+                }
+                break;
+            case SystemState::MEASUREMENT:
+                if (g_measurementEngine.isDone()) {
+                    requestTransition(SystemState::VALIDATION);
+                }
+                break;
+            default:
+                break;
+        }
     }
 
     // Apply pending transition

@@ -47,8 +47,6 @@ void loop() {
         g_measurementEngine.tick();
     }
 
-    // Periodic web tasks (mDNS etc.)
+    // Periodic web tasks (WiFi STA connection state machine)
     webServerLoop();
-
-    delay(10);
 }

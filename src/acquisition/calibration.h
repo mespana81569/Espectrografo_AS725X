@@ -17,6 +17,7 @@ public:
     void tick();
     bool isDone() const;
     bool hasFailed() const;
+    void clearDoneFlag();
 
     const CalibrationData& getData() const;
     void reset();
@@ -26,11 +27,12 @@ public:
 
 private:
     CalibrationData _data;
-    bool   _running;
-    bool   _done;
-    bool   _failed;
-    int    _samplesCollected;
-    float  _accumulator[NUM_CHANNELS];
+    bool          _running;
+    bool          _done;
+    bool          _failed;
+    int           _samplesCollected;
+    float         _accumulator[NUM_CHANNELS];
+    unsigned long _lastSampleTime;
 };
 
 extern Calibration g_calibration;

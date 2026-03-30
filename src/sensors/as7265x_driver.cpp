@@ -97,13 +97,14 @@ bool AS7265xDriver::takeMeasurement(float* out18) {
 
 void AS7265xDriver::setSleepMode(bool sleep) {
     if (!_initialized) return;
+    // The AS7265X has no true standby register. Disabling the bulbs is the
+    // only safe idle action — do NOT touch the measurement-mode register here
+    // because applyConfig() already set it correctly and overwriting it would
+    // corrupt subsequent measurements.
     if (sleep) {
         _sensor.disableBulb(AS7265x_LED_WHITE);
         _sensor.disableBulb(AS7265x_LED_IR);
         _sensor.disableBulb(AS7265x_LED_UV);
-        // No true standby in AS7265X — one-shot mode stops converting after one cycle (lowest idle power)
-        _sensor.setMeasurementMode(AS7265X_MEASUREMENT_MODE_6CHAN_ONE_SHOT);
-    } else {
-        _sensor.setMeasurementMode(static_cast<uint8_t>(_cfg.mode));
     }
+    // On wake-up, applyConfig() was already called during begin(); no action needed.
 }

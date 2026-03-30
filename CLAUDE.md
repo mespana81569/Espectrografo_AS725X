@@ -87,3 +87,36 @@ Managed via `platformio.ini`:
 - `ESPAsyncWebServer-esphome` + `AsyncTCP-esphome` — non-blocking HTTP
 - `ArduinoJson` v7 — JSON serialization in API routes
 - `arduino-libraries/SD` — microSD via SPI
+
+## Problems
+[IDLE]
+  ↓ user clicks "1. Start Calibration"
+  POST /api/calibrate → requestTransition(CALIBRATION)  [thread-safe]
+  
+[CALIBRATION]
+  g_calibration.tick() collects 5 samples × 200ms = ~1 second
+  g_calibration._done = true
+  StateMachine::tick() auto-transitions → exitState(CALIBRATION)
+    → g_sdLogger.saveCalibration(...)  ← calibration saved to SD here
+    → g_calibration.clearDoneFlag()    ← prevents re-trigger
+  → enterState(WAIT_CONFIRMATION)
+  
+[WAIT_CONFIRMATION]
+  UI: btnConfirm enabled, all others disabled
+  User physically inserts sample cuvette
+  User clicks "2. Insert Sample & Confirm"
+  POST /api/confirm → requestTransition(MEASUREMENT)  [thread-safe]
+  
+[MEASUREMENT]
+  g_measurementEngine.tick() collects N spectra
+  StateMachine::tick() auto-transitions → VALIDATION
+  
+[VALIDATION]
+  UI: btnAccept enabled
+  User clicks "4. Accept & Proceed to Save"
+  POST /api/accept → requestTransition(SAVE_DECISION)
+  
+[SAVE_DECISION]
+  UI: btnSave + btnDiscard enabled
+  User clicks "5. Save to SD Card"
+  POST /api/save → g_sdLogger.saveExperiment(...) → back to IDLE

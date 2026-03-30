@@ -79,6 +79,33 @@ bool SDLogger::saveExperiment(const Experiment& exp) {
     return true;
 }
 
+bool SDLogger::saveCalibration(const CalibrationData& cal) {
+    if (!_ready) {
+        Serial.println("[SD] Not ready, cannot save calibration");
+        return false;
+    }
+
+    File f = SD.open(CAL_FILE, FILE_WRITE);
+    if (!f) {
+        Serial.println("[SD] Failed to open calibration file");
+        return false;
+    }
+
+    // Header
+    f.print("channel,offset,reference\n");
+
+    // One row per channel
+    for (int i = 0; i < NUM_CHANNELS; i++) {
+        char line[64];
+        snprintf(line, sizeof(line), "%d,%.4f,%.4f\n", i, cal.offset[i], cal.reference[i]);
+        f.print(line);
+    }
+
+    f.close();
+    Serial.println("[SD] Calibration saved");
+    return true;
+}
+
 bool SDLogger::writeRow(const char* line) {
     File f = SD.open(LOG_FILE, FILE_WRITE);
     if (!f) return false;

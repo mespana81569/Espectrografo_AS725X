@@ -1,4 +1,5 @@
 #include "api_routes.h"
+#include "web_server.h"
 #include "../core/state_machine.h"
 #include "../sensors/as7265x_driver.h"
 #include "../acquisition/measurement_engine.h"
@@ -186,6 +187,25 @@ static void handleAcceptValidation(AsyncWebServerRequest* req) {
     sendOk(req, "proceed_to_save");
 }
 
+// ─── GET /api/wifi ────────────────────────────────────────────────────────────
+static void handleGetWifi(AsyncWebServerRequest* req) {
+    String status = wifiStaStatus();
+    sendJson(req, "{\"status\":\"" + status + "\"}");
+}
+
+// ─── POST /api/wifi ───────────────────────────────────────────────────────────
+// Body: { "ssid": "MyNetwork", "password": "secret" }
+static void handleSetWifi(AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
+    StaticJsonDocument<192> doc;
+    DeserializationError err = deserializeJson(doc, data, len);
+    if (err) { sendError(req, "Invalid JSON"); return; }
+    const char* ssid = doc["ssid"] | "";
+    const char* pass = doc["password"] | "";
+    if (strlen(ssid) == 0) { sendError(req, "ssid required"); return; }
+    wifiRequestConnect(ssid, pass);
+    sendOk(req, "connecting");
+}
+
 // ─── Registration ─────────────────────────────────────────────────────────────
 void registerApiRoutes(AsyncWebServer& server) {
     server.on("/api/status",     HTTP_GET,  handleGetStatus);
@@ -198,11 +218,19 @@ void registerApiRoutes(AsyncWebServer& server) {
     server.on("/api/accept",     HTTP_POST, handleAcceptValidation);
     server.on("/api/save",       HTTP_POST, handleSave);
     server.on("/api/discard",    HTTP_POST, handleDiscard);
+    server.on("/api/wifi",       HTTP_GET,  handleGetWifi);
 
     // POST with body (config)
     server.on("/api/config", HTTP_POST,
-        [](AsyncWebServerRequest* req){},  // empty handler, body handled below
+        [](AsyncWebServerRequest* req){},
         nullptr,
         handleSetConfig
+    );
+
+    // POST with body (wifi credentials)
+    server.on("/api/wifi", HTTP_POST,
+        [](AsyncWebServerRequest* req){},
+        nullptr,
+        handleSetWifi
     );
 }

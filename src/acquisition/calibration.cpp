@@ -5,8 +5,13 @@
 
 Calibration g_calibration;
 
+// Minimum gap between samples — sensor integration time at 50 cycles ≈ 140ms,
+// give it 200ms margin so the sensor has settled before the next read.
+static const unsigned long CAL_SAMPLE_INTERVAL_MS = 200;
+
 Calibration::Calibration()
-    : _running(false), _done(false), _failed(false), _samplesCollected(0) {
+    : _running(false), _done(false), _failed(false),
+      _samplesCollected(0), _lastSampleTime(0) {
     memset(&_data, 0, sizeof(_data));
     memset(_accumulator, 0, sizeof(_accumulator));
 }
@@ -16,6 +21,7 @@ void Calibration::start() {
     _done    = false;
     _failed  = false;
     _samplesCollected = 0;
+    _lastSampleTime   = 0;   // force immediate first sample
     memset(_accumulator, 0, sizeof(_accumulator));
     memset(&_data, 0, sizeof(_data));
     Serial.println("[Cal] Calibration started");
@@ -23,6 +29,10 @@ void Calibration::start() {
 
 void Calibration::tick() {
     if (!_running || _done) return;
+
+    unsigned long now = millis();
+    if (now - _lastSampleTime < CAL_SAMPLE_INTERVAL_MS) return;
+    _lastSampleTime = now;
 
     float reading[NUM_CHANNELS];
     if (!g_sensorDriver.takeMeasurement(reading)) {
@@ -41,20 +51,18 @@ void Calibration::tick() {
     if (_samplesCollected >= CALIBRATION_AVERAGES) {
         for (int i = 0; i < NUM_CHANNELS; i++) {
             _data.reference[i] = _accumulator[i] / CALIBRATION_AVERAGES;
-            _data.offset[i]    = _data.reference[i]; // offset = blank mean
+            _data.offset[i]    = _data.reference[i];
         }
         _data.valid = true;
         _done    = true;
         _running = false;
         Serial.println("[Cal] Calibration complete");
     }
-
-    // Inter-sample delay for stable readings
-    delay(200);
 }
 
 bool Calibration::isDone() const { return _done; }
 bool Calibration::hasFailed() const { return _failed; }
+void Calibration::clearDoneFlag() { _done = false; }
 
 const CalibrationData& Calibration::getData() const { return _data; }
 

@@ -44,8 +44,12 @@ static void handleGetConfig(AsyncWebServerRequest* req) {
     doc["gain"]             = (uint8_t)cfg.gain;
     doc["integrationCycles"] = cfg.integrationCycles;
     doc["mode"]             = (uint8_t)cfg.mode;
-    doc["ledCurrent"]       = cfg.ledCurrent;
-    doc["ledEnabled"]       = cfg.ledEnabled;
+    doc["ledWhiteCurrent"]  = cfg.ledWhiteCurrent;
+    doc["ledIrCurrent"]     = cfg.ledIrCurrent;
+    doc["ledUvCurrent"]     = cfg.ledUvCurrent;
+    doc["ledWhiteEnabled"]  = cfg.ledWhiteEnabled;
+    doc["ledIrEnabled"]     = cfg.ledIrEnabled;
+    doc["ledUvEnabled"]     = cfg.ledUvEnabled;
     String out;
     serializeJson(doc, out);
     sendJson(req, out);
@@ -66,8 +70,12 @@ static void handleSetConfig(AsyncWebServerRequest* req, uint8_t* data, size_t le
     if (doc.containsKey("gain"))              cfg.gain             = (SensorGain)(uint8_t)doc["gain"];
     if (doc.containsKey("integrationCycles")) cfg.integrationCycles = doc["integrationCycles"];
     if (doc.containsKey("mode"))              cfg.mode             = (MeasurementMode)(uint8_t)doc["mode"];
-    if (doc.containsKey("ledCurrent"))        cfg.ledCurrent       = doc["ledCurrent"];
-    if (doc.containsKey("ledEnabled"))        cfg.ledEnabled       = doc["ledEnabled"];
+    if (doc.containsKey("ledWhiteCurrent"))    cfg.ledWhiteCurrent  = doc["ledWhiteCurrent"];
+    if (doc.containsKey("ledIrCurrent"))      cfg.ledIrCurrent     = doc["ledIrCurrent"];
+    if (doc.containsKey("ledUvCurrent"))      cfg.ledUvCurrent     = doc["ledUvCurrent"];
+    if (doc.containsKey("ledWhiteEnabled"))   cfg.ledWhiteEnabled  = doc["ledWhiteEnabled"];
+    if (doc.containsKey("ledIrEnabled"))      cfg.ledIrEnabled     = doc["ledIrEnabled"];
+    if (doc.containsKey("ledUvEnabled"))      cfg.ledUvEnabled     = doc["ledUvEnabled"];
 
     g_sensorDriver.applyConfig(cfg);
 
@@ -187,6 +195,50 @@ static void handleAcceptValidation(AsyncWebServerRequest* req) {
     sendOk(req, "proceed_to_save");
 }
 
+// ─── Live monitor buffer (owned by main.cpp) ─────────────────────────────────
+extern float    g_liveBuf[18];
+extern volatile bool g_liveReady;
+
+// ─── POST /api/monitor/start ─────────────────────────────────────────────────
+static void handleMonitorStart(AsyncWebServerRequest* req) {
+    if (g_stateMachine.getState() != SystemState::IDLE) {
+        sendError(req, "Must be IDLE to start monitor");
+        return;
+    }
+    g_stateMachine.requestTransition(SystemState::LIVE_MONITOR);
+    sendOk(req, "monitor_started");
+}
+
+// ─── POST /api/monitor/stop ──────────────────────────────────────────────────
+static void handleMonitorStop(AsyncWebServerRequest* req) {
+    if (g_stateMachine.getState() != SystemState::LIVE_MONITOR) {
+        sendError(req, "Not in LIVE_MONITOR state");
+        return;
+    }
+    g_stateMachine.requestTransition(SystemState::IDLE);
+    sendOk(req, "monitor_stopped");
+}
+
+// ─── GET /api/monitor ────────────────────────────────────────────────────────
+static void handleMonitorData(AsyncWebServerRequest* req) {
+    if (!g_liveReady) {
+        sendJson(req, "{\"ready\":false}");
+        return;
+    }
+    String json = "{\"ready\":true,\"ch\":[";
+    for (int i = 0; i < NUM_CHANNELS; i++) {
+        if (i) json += ",";
+        json += String(g_liveBuf[i], 4);
+    }
+    json += "],\"wl\":[";
+    for (int i = 0; i < NUM_CHANNELS; i++) {
+        if (i) json += ",";
+        json += AS7265xDriver::WAVELENGTHS[i];
+    }
+    json += "]}";
+    sendJson(req, json);
+}
+
 // ─── GET /api/wifi ────────────────────────────────────────────────────────────
 static void handleGetWifi(AsyncWebServerRequest* req) {
     String status = wifiStaStatus();
@@ -219,6 +271,9 @@ void registerApiRoutes(AsyncWebServer& server) {
     server.on("/api/save",       HTTP_POST, handleSave);
     server.on("/api/discard",    HTTP_POST, handleDiscard);
     server.on("/api/wifi",       HTTP_GET,  handleGetWifi);
+    server.on("/api/monitor",    HTTP_GET,  handleMonitorData);
+    server.on("/api/monitor/start", HTTP_POST, handleMonitorStart);
+    server.on("/api/monitor/stop",  HTTP_POST, handleMonitorStop);
 
     // POST with body (config)
     server.on("/api/config", HTTP_POST,

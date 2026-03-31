@@ -35,7 +35,7 @@ bool SDLogger::ensureHeader() {
         Serial.println("[SD] Cannot create log file");
         return false;
     }
-    f.println("date_ms,exp_id,meas_idx,gain,mode,int_cycles,led_ma,"
+    f.println("date_ms,exp_id,meas_idx,gain,mode,int_cycles,led_white_ma,led_ir_ma,led_uv_ma,"
               "ch1,ch2,ch3,ch4,ch5,ch6,ch7,ch8,ch9,"
               "ch10,ch11,ch12,ch13,ch14,ch15,ch16,ch17,ch18");
     f.close();
@@ -58,14 +58,16 @@ bool SDLogger::saveExperiment(const Experiment& exp) {
     for (int i = 0; i < exp.count; i++) {
         char line[256];
         int pos = snprintf(line, sizeof(line),
-            "%u,%s,%d,%u,%u,%u,%u",
+            "%u,%s,%d,%u,%u,%u,%u,%u,%u",
             exp.timestamp,
             exp.experiment_id,
             i,
             (uint8_t)cfg.gain,
             (uint8_t)cfg.mode,
             cfg.integrationCycles,
-            cfg.ledCurrent);
+            cfg.ledWhiteCurrent,
+            cfg.ledIrCurrent,
+            cfg.ledUvCurrent);
 
         for (int j = 0; j < NUM_CHANNELS; j++) {
             pos += snprintf(line + pos, sizeof(line) - pos, ",%.4f", exp.spectra[i][j]);

@@ -6,7 +6,8 @@ enum class SystemState {
     WAIT_CONFIRMATION,
     MEASUREMENT,
     VALIDATION,
-    SAVE_DECISION
+    SAVE_DECISION,
+    LIVE_MONITOR
 };
 
 class StateMachine {

@@ -29,6 +29,7 @@ const char* StateMachine::getStateName() const {
         case SystemState::MEASUREMENT:       return "MEASUREMENT";
         case SystemState::VALIDATION:        return "VALIDATION";
         case SystemState::SAVE_DECISION:     return "SAVE_DECISION";
+        case SystemState::LIVE_MONITOR:      return "LIVE_MONITOR";
         default:                             return "UNKNOWN";
     }
 }
@@ -54,6 +55,9 @@ void StateMachine::enterState(SystemState s) {
             break;
         case SystemState::SAVE_DECISION:
             // Await user YES/NO via web
+            break;
+        case SystemState::LIVE_MONITOR:
+            g_sensorDriver.setSleepMode(false);
             break;
     }
 }

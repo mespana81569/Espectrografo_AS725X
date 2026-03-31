@@ -6,6 +6,10 @@
 #include "storage/sd_logger.h"
 #include "web/web_server.h"
 
+// Live monitor shared buffer — read by GET /api/monitor
+float    g_liveBuf[18] = {0};
+volatile bool g_liveReady = false;
+
 // ─── Setup ───────────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
@@ -45,6 +49,19 @@ void loop() {
     // Drive acquisition while in MEASUREMENT state
     if (g_stateMachine.getState() == SystemState::MEASUREMENT) {
         g_measurementEngine.tick();
+    }
+
+    // Drive live monitor — continuous reads, no saving
+    if (g_stateMachine.getState() == SystemState::LIVE_MONITOR) {
+        static uint32_t _lmLast = 0;
+        if (millis() - _lmLast >= 100) {
+            _lmLast = millis();
+            if (g_sensorDriver.takeMeasurement(g_liveBuf)) {
+                g_liveReady = true;
+            }
+        }
+    } else {
+        g_liveReady = false;
     }
 
     // Periodic web tasks (WiFi STA connection state machine)

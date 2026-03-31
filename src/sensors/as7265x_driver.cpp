@@ -22,6 +22,7 @@ bool AS7265xDriver::begin() {
         return false;
     }
     _initialized = true;
+    _sensor.disableIndicator();  // turn off the onboard status LED
     applyConfig(_cfg);
     Serial.println("[Sensor] AS7265X ready");
     return true;
@@ -29,6 +30,13 @@ bool AS7265xDriver::begin() {
 
 bool AS7265xDriver::isReady() const {
     return _initialized;
+}
+
+static uint8_t maToConst(uint8_t ma) {
+    if      (ma <= 12)  return AS7265X_LED_CURRENT_LIMIT_12_5MA;
+    else if (ma <= 25)  return AS7265X_LED_CURRENT_LIMIT_25MA;
+    else if (ma <= 50)  return AS7265X_LED_CURRENT_LIMIT_50MA;
+    else                return AS7265X_LED_CURRENT_LIMIT_100MA;
 }
 
 void AS7265xDriver::applyConfig(const SensorConfig& cfg) {
@@ -39,16 +47,9 @@ void AS7265xDriver::applyConfig(const SensorConfig& cfg) {
     _sensor.setIntegrationCycles(cfg.integrationCycles);
     _sensor.setMeasurementMode(static_cast<uint8_t>(cfg.mode));
 
-    // Map mA value to library LED current constant
-    uint8_t ledConst;
-    if      (cfg.ledCurrent <= 12)  ledConst = AS7265X_LED_CURRENT_LIMIT_12_5MA;
-    else if (cfg.ledCurrent <= 25)  ledConst = AS7265X_LED_CURRENT_LIMIT_25MA;
-    else if (cfg.ledCurrent <= 50)  ledConst = AS7265X_LED_CURRENT_LIMIT_50MA;
-    else                            ledConst = AS7265X_LED_CURRENT_LIMIT_100MA;
-
-    _sensor.setBulbCurrent(ledConst, AS7265x_LED_WHITE);
-    _sensor.setBulbCurrent(ledConst, AS7265x_LED_IR);
-    _sensor.setBulbCurrent(ledConst, AS7265x_LED_UV);
+    _sensor.setBulbCurrent(maToConst(cfg.ledWhiteCurrent), AS7265x_LED_WHITE);
+    _sensor.setBulbCurrent(maToConst(cfg.ledIrCurrent),    AS7265x_LED_IR);
+    _sensor.setBulbCurrent(maToConst(cfg.ledUvCurrent),    AS7265x_LED_UV);
 }
 
 SensorConfig AS7265xDriver::getConfig() const {
@@ -58,19 +59,15 @@ SensorConfig AS7265xDriver::getConfig() const {
 bool AS7265xDriver::takeMeasurement(float* out18) {
     if (!_initialized) return false;
 
-    if (_cfg.ledEnabled) {
-        _sensor.enableBulb(AS7265x_LED_WHITE);
-        _sensor.enableBulb(AS7265x_LED_IR);
-        _sensor.enableBulb(AS7265x_LED_UV);
-    }
+    if (_cfg.ledWhiteEnabled) _sensor.enableBulb(AS7265x_LED_WHITE);
+    if (_cfg.ledIrEnabled)    _sensor.enableBulb(AS7265x_LED_IR);
+    if (_cfg.ledUvEnabled)    _sensor.enableBulb(AS7265x_LED_UV);
 
     _sensor.takeMeasurementsWithBulb();
 
-    if (_cfg.ledEnabled) {
-        _sensor.disableBulb(AS7265x_LED_WHITE);
-        _sensor.disableBulb(AS7265x_LED_IR);
-        _sensor.disableBulb(AS7265x_LED_UV);
-    }
+    _sensor.disableBulb(AS7265x_LED_WHITE);
+    _sensor.disableBulb(AS7265x_LED_IR);
+    _sensor.disableBulb(AS7265x_LED_UV);
 
     // Channels in order: A B C D E F (UV) | G H I J K L (VIS) | R S T U V W (NIR)
     out18[0]  = _sensor.getCalibratedA();

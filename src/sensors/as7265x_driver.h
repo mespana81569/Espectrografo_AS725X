@@ -18,11 +18,15 @@ enum class MeasurementMode : uint8_t {
 };
 
 struct SensorConfig {
-    SensorGain    gain           = SensorGain::GAIN_16X;
-    uint8_t       integrationCycles = 50;   // 2.8ms per cycle, 50 = ~140ms
-    MeasurementMode mode         = MeasurementMode::MODE_3;
-    uint8_t       ledCurrent     = 12;      // mA: 12, 25, 50, 100
-    bool          ledEnabled     = false;
+    SensorGain      gain              = SensorGain::GAIN_16X;
+    uint8_t         integrationCycles = 50;   // 2.8ms per cycle, 50 = ~140ms
+    MeasurementMode mode              = MeasurementMode::MODE_3;
+    uint8_t         ledWhiteCurrent   = 12;   // mA: 12, 25, 50, 100
+    uint8_t         ledIrCurrent      = 12;
+    uint8_t         ledUvCurrent      = 12;
+    bool            ledWhiteEnabled   = false;
+    bool            ledIrEnabled      = false;
+    bool            ledUvEnabled      = false;
 };
 
 class AS7265xDriver {

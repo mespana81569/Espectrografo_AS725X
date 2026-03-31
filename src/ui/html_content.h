@@ -57,7 +57,8 @@ static const char HTML_CONTENT[] PROGMEM = R"rawhtml(
     border-radius:.3rem;padding:.3rem;border:1px solid var(--bdr);margin-top:.35rem;font-family:monospace}
 
   /* Canvas */
-  #chart{width:100%;height:240px;display:block}
+  .cv{width:100%;height:240px;display:block}
+  .hidden{display:none!important}
 </style>
 </head>
 <body>
@@ -89,6 +90,10 @@ static const char HTML_CONTENT[] PROGMEM = R"rawhtml(
     <button class="bA" id="b4" onclick="act('accept')" disabled>4. Accept Results</button>
     <button class="bG" id="b5" onclick="act('save')" disabled>5. Save to SD</button>
     <button class="bR" id="b6" onclick="act('discard')" disabled>Discard</button>
+
+    <h2 style="margin-top:.5rem">Diagnostics</h2>
+    <button class="bA" id="bMon" onclick="monStart()">Live Monitor</button>
+    <button class="bR" id="bMonStop" onclick="monStop()" disabled>Stop Monitor</button>
     <div id="log"></div>
   </div>
 
@@ -104,9 +109,13 @@ static const char HTML_CONTENT[] PROGMEM = R"rawhtml(
     <input type="number" id="intCycles" value="50" min="1" max="255"/>
     <label>Measurements (N, max 20)</label>
     <input type="number" id="measN" value="5" min="1" max="20"/>
-    <label>LED Current</label>
-    <select id="ledCurrent"><option value="12" selected>12.5 mA</option><option value="25">25 mA</option>
-      <option value="50">50 mA</option><option value="100">100 mA</option></select>
+    <h2 style="margin-top:.5rem">LED Bulbs</h2>
+    <div class="row"><input type="checkbox" id="ledW" style="width:auto"><label style="margin:0;display:inline">White (VIS)</label>
+      <select id="ledWmA" style="width:5rem;margin-left:auto"><option value="12" selected>12.5</option><option value="25">25</option><option value="50">50</option><option value="100">100</option></select><span style="font-size:.7rem;color:var(--muted)">mA</span></div>
+    <div class="row"><input type="checkbox" id="ledI" style="width:auto"><label style="margin:0;display:inline">IR (NIR)</label>
+      <select id="ledImA" style="width:5rem;margin-left:auto"><option value="12" selected>12.5</option><option value="25">25</option><option value="50">50</option><option value="100">100</option></select><span style="font-size:.7rem;color:var(--muted)">mA</span></div>
+    <div class="row"><input type="checkbox" id="ledU" style="width:auto"><label style="margin:0;display:inline">UV</label>
+      <select id="ledUmA" style="width:5rem;margin-left:auto"><option value="12" selected>12.5</option><option value="25">25</option><option value="50">50</option><option value="100">100</option></select><span style="font-size:.7rem;color:var(--muted)">mA</span></div>
     <button class="bA" onclick="applyCfg()">Apply Config</button>
 
     <h2 style="margin-top:.7rem">WiFi</h2>
@@ -119,9 +128,15 @@ static const char HTML_CONTENT[] PROGMEM = R"rawhtml(
   </div>
 
   <!-- Spectra chart -->
-  <div class="c full">
+  <div class="c full" id="chartCard">
     <h2>Spectra (last 3 measurements)</h2>
-    <canvas id="chart" height="240"></canvas>
+    <canvas id="chart" class="cv" height="240"></canvas>
+  </div>
+
+  <!-- Live Monitor chart (separate) -->
+  <div class="c full hidden" id="liveCard">
+    <h2>Live Monitor (real-time raw data)</h2>
+    <canvas id="liveChart" class="cv" height="240"></canvas>
   </div>
 </div>
 
@@ -164,12 +179,19 @@ function updPipe(state){
 
 /* ─── Buttons ───────────────────────────────────────────────────────────── */
 function updBtns(s){
-  document.getElementById('b1').disabled = s!=='IDLE';
-  document.getElementById('b2').disabled = s!=='WAIT_CONFIRMATION';
-  document.getElementById('b3').disabled = s!=='WAIT_CONFIRMATION'&&s!=='IDLE';
-  document.getElementById('b4').disabled = s!=='VALIDATION';
-  document.getElementById('b5').disabled = s!=='SAVE_DECISION';
-  document.getElementById('b6').disabled = s!=='SAVE_DECISION';
+  var idle=s==='IDLE';
+  var live=s==='LIVE_MONITOR';
+  document.getElementById('b1').disabled      = !idle;
+  document.getElementById('b2').disabled      = s!=='WAIT_CONFIRMATION';
+  document.getElementById('b3').disabled      = s!=='WAIT_CONFIRMATION'&&!idle;
+  document.getElementById('b4').disabled      = s!=='VALIDATION';
+  document.getElementById('b5').disabled      = s!=='SAVE_DECISION';
+  document.getElementById('b6').disabled      = s!=='SAVE_DECISION';
+  document.getElementById('bMon').disabled    = !idle;
+  document.getElementById('bMonStop').disabled= !live;
+  // Toggle chart sections
+  document.getElementById('chartCard').classList.toggle('hidden',live);
+  document.getElementById('liveCard').classList.toggle('hidden',!live);
 }
 
 /* ─── Actions ───────────────────────────────────────────────────────────── */
@@ -185,8 +207,12 @@ function applyCfg(){
     gain:parseInt(document.getElementById('gain').value),
     integrationCycles:parseInt(document.getElementById('intCycles').value),
     mode:3,
-    ledCurrent:parseInt(document.getElementById('ledCurrent').value),
-    ledEnabled:true,
+    ledWhiteCurrent:parseInt(document.getElementById('ledWmA').value),
+    ledIrCurrent:parseInt(document.getElementById('ledImA').value),
+    ledUvCurrent:parseInt(document.getElementById('ledUmA').value),
+    ledWhiteEnabled:document.getElementById('ledW').checked,
+    ledIrEnabled:document.getElementById('ledI').checked,
+    ledUvEnabled:document.getElementById('ledU').checked,
     N:parseInt(document.getElementById('measN').value),
     expId:document.getElementById('expId').value.trim()||'EXP_001'
   };
@@ -294,10 +320,91 @@ function drawChart(data){
   }
 }
 
+/* ─── Live Monitor ─────────────────────────────────────────────────────── */
+function monStart(){
+  api('/api/monitor/start','POST').then(function(r){
+    if(r)lg('Monitor: '+(r.status||r.error));
+    poll();
+  });
+}
+function monStop(){
+  api('/api/monitor/stop','POST').then(function(r){
+    if(r)lg('Monitor: '+(r.status||r.error));
+    poll();
+  });
+}
+
+/* wavelength→colour for bar chart */
+function wlClr(nm){
+  if(nm<450)return'#8b5cf6';if(nm<500)return'#3b82f6';if(nm<560)return'#22c55e';
+  if(nm<600)return'#eab308';if(nm<650)return'#f97316';if(nm<750)return'#ef4444';
+  return'#991b1b';
+}
+
+function drawLive(data){
+  var cv=document.getElementById('liveChart');
+  if(!cv)return;
+  var ctx=cv.getContext('2d');
+  var rect=cv.getBoundingClientRect();
+  var dpr=window.devicePixelRatio||1;
+  cv.width=rect.width*dpr;cv.height=rect.height*dpr;
+  ctx.scale(dpr,dpr);
+  var W=rect.width,H=rect.height;
+  ctx.clearRect(0,0,W,H);
+
+  var ch=data.ch, wl=data.wl;
+  if(!ch||!wl||ch.length!==18)return;
+
+  var mx=0;
+  for(var i=0;i<ch.length;i++)if(ch[i]>mx)mx=ch[i];
+  if(mx===0)mx=1;
+
+  var L=48,R=12,T=18,B=30;
+  var pW=W-L-R,pH=H-T-B;
+  var bw=pW/ch.length*0.7;
+  var gap=pW/ch.length;
+
+  /* grid */
+  ctx.strokeStyle='#334155';ctx.lineWidth=0.5;
+  for(var i=0;i<=4;i++){
+    var y=T+pH*(1-i/4);
+    ctx.beginPath();ctx.moveTo(L,y);ctx.lineTo(W-R,y);ctx.stroke();
+  }
+
+  /* Y labels */
+  ctx.fillStyle='#94a3b8';ctx.font='9px sans-serif';ctx.textAlign='right';
+  for(var i=0;i<=4;i++){
+    var y=T+pH*(1-i/4);
+    ctx.fillText((mx*i/4).toFixed(1),L-4,y+3);
+  }
+
+  /* bars + X labels */
+  var names='ABCDEFGHIJKLRSTUVW';
+  ctx.textAlign='center';
+  for(var i=0;i<ch.length;i++){
+    var x=L+gap*i+gap/2-bw/2;
+    var h=ch[i]/mx*pH;
+    ctx.fillStyle=wlClr(wl[i]);
+    ctx.fillRect(x,T+pH-h,bw,h);
+    /* label */
+    ctx.fillStyle='#94a3b8';ctx.font='8px sans-serif';
+    ctx.fillText(wl[i],L+gap*i+gap/2,H-14);
+    ctx.fillText(names[i],L+gap*i+gap/2,H-4);
+  }
+}
+
+function monitorLoop(){
+  if(cur!=='LIVE_MONITOR'){setTimeout(monitorLoop,500);return;}
+  api('/api/monitor').then(function(d){
+    if(d&&d.ready)drawLive(d);
+  });
+  setTimeout(monitorLoop,600);
+}
+
 /* ─── Self-scheduling loops (never overlap) ─────────────────────────────── */
 function statusLoop(){
   poll();
-  var fast=(cur==='CALIBRATION'||cur==='MEASUREMENT');
+  var fast=(cur==='CALIBRATION'||cur==='MEASUREMENT'||cur==='LIVE_MONITOR');
   setTimeout(statusLoop,fast?800:1500);
 }
 
@@ -324,6 +431,7 @@ lg('UI ready (standalone, no CDN)');
 statusLoop();
 setTimeout(spectraLoop,400);
 setTimeout(wifiLoop,900);
+setTimeout(monitorLoop,600);
 </script>
 </body>
 </html>

@@ -120,8 +120,11 @@ static const char HTML_CONTENT[] PROGMEM = R"rawhtml(
 
     <h2 style="margin-top:.7rem">WiFi</h2>
     <div class="row"><span class="d" id="dW"></span><span id="lW">--</span></div>
-    <label>SSID</label>
-    <input type="text" id="wSSID" placeholder="Network name"/>
+    <label>Network</label>
+    <div class="row" style="gap:.3rem">
+      <select id="wSSID" style="flex:1"><option value="">-- Scan first --</option></select>
+      <button class="bA" style="width:auto;padding:.32rem .6rem;margin:0" onclick="scanWifi()" id="bScan">Scan</button>
+    </div>
     <label>Password</label>
     <input type="password" id="wPASS" placeholder="Password"/>
     <button class="bA" onclick="connectWifi()">Connect</button>
@@ -198,6 +201,23 @@ function updBtns(s){
 function act(a){
   api('/api/'+a,'POST').then(function(r){
     if(r)lg(a+': '+(r.status||r.error||'ok'));
+    // After a successful save, auto-increment experiment ID in the UI
+    if(a==='save' && r && r.status==='saved'){
+      var el=document.getElementById('expId');
+      var v=el.value.trim();
+      // Try to increment trailing number: EXP_001 → EXP_002, Test3 → Test4
+      var m=v.match(/^(.*?)(\d+)$/);
+      if(m){
+        var num=parseInt(m[2])+1;
+        var pad=m[2].length;
+        var ns=String(num);
+        while(ns.length<pad)ns='0'+ns;
+        el.value=m[1]+ns;
+      } else {
+        el.value=v+'_2';
+      }
+      lg('Next experiment: '+el.value);
+    }
     poll();
   });
 }
@@ -221,10 +241,56 @@ function applyCfg(){
   });
 }
 
+function scanWifi(){
+  var btn=document.getElementById('bScan');
+  btn.disabled=true;btn.textContent='...';
+  lg('WiFi: scan starting (AP will drop briefly)...');
+  // POST triggers the scan — AP will go down, phone will disconnect
+  api('/api/wifi/scan','POST').then(function(){});
+  // AP is going down — we'll lose connection for ~10 seconds
+  lg('WiFi: AP offline for ~10s while scanning...');
+  // Poll for results after AP comes back (3s settle + 4s scan + 2s AP restore)
+  var attempts=0;
+  setTimeout(function pollScan(){
+    attempts++;
+    api('/api/wifi/scan').then(function(r){
+      if(!r||r.scanning){
+        // AP not back yet or still scanning — retry (up to 25 attempts = ~75s)
+        if(attempts<25){setTimeout(pollScan,3000);return;}
+        lg('WiFi: scan timeout — try again');
+        btn.disabled=false;btn.textContent='Scan';
+        return;
+      }
+      populateNetworks(r.networks);
+      btn.disabled=false;btn.textContent='Scan';
+    });
+  },10000);  // first poll after 10s
+}
+
+function populateNetworks(nets){
+  var sel=document.getElementById('wSSID');
+  sel.innerHTML='';
+  if(!nets||nets.length===0){
+    sel.innerHTML='<option value="">No networks found</option>';
+    lg('WiFi: no networks found');
+    return;
+  }
+  // Sort by signal strength (already sorted by ESP32, but ensure)
+  nets.sort(function(a,b){return b.rssi-a.rssi;});
+  for(var i=0;i<nets.length;i++){
+    var o=document.createElement('option');
+    o.value=nets[i].ssid;
+    o.textContent=nets[i].ssid+' ('+nets[i].rssi+' dBm)'+(nets[i].enc?'':' [open]');
+    sel.appendChild(o);
+  }
+  lg('WiFi: found '+nets.length+' networks');
+}
+
 function connectWifi(){
-  var ssid=document.getElementById('wSSID').value.trim();
+  var ssid=document.getElementById('wSSID').value;
   var pass=document.getElementById('wPASS').value;
-  if(!ssid){lg('SSID required');return;}
+  if(!ssid){lg('SSID required — press Scan first');return;}
+  lg('WiFi: connecting to '+ssid+'...');
   api('/api/wifi','POST',{ssid:ssid,password:pass}).then(function(r){
     if(r)lg('WiFi: '+(r.status||r.error));
   });
@@ -415,15 +481,25 @@ function spectraLoop(){
   setTimeout(spectraLoop,3000);
 }
 
+var lastWifiSt='';
 function wifiLoop(){
   api('/api/wifi').then(function(r){
     if(!r)return;
     var st=r.status||'';
-    var ok=st.indexOf('connected')===0;
-    document.getElementById('dW').className='d '+(ok?'ok':(st==='connecting'?'wa':'er'));
-    document.getElementById('lW').textContent=st;
+    var ok=st.indexOf('connected:')===0;
+    var cls=ok?'ok':(st==='connecting'?'wa':'er');
+    if(st==='not_configured')cls='';
+    document.getElementById('dW').className='d '+cls;
+    document.getElementById('lW').textContent=ok?st.replace('connected:','IP: '):st;
+    if(st!==lastWifiSt){
+      if(ok)lg('WiFi connected: '+st.replace('connected:',''));
+      else if(st==='failed')lg('WiFi connection failed');
+      else if(st==='ssid_not_found')lg('WiFi SSID not found');
+      else if(st==='connecting')lg('WiFi connecting...');
+      lastWifiSt=st;
+    }
   });
-  setTimeout(wifiLoop,5000);
+  setTimeout(wifiLoop,3000);
 }
 
 /* ─── Boot ──────────────────────────────────────────────────────────────── */

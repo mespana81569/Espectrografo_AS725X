@@ -40,7 +40,7 @@ static void handleGetStatus(AsyncWebServerRequest* req) {
 // ─── GET /api/config ─────────────────────────────────────────────────────────
 static void handleGetConfig(AsyncWebServerRequest* req) {
     SensorConfig cfg = g_sensorDriver.getConfig();
-    StaticJsonDocument<128> doc;
+    StaticJsonDocument<384> doc;
     doc["gain"]             = (uint8_t)cfg.gain;
     doc["integrationCycles"] = cfg.integrationCycles;
     doc["mode"]             = (uint8_t)cfg.mode;
@@ -62,7 +62,7 @@ static void handleSetConfig(AsyncWebServerRequest* req, uint8_t* data, size_t le
         sendError(req, "Config only allowed in IDLE state");
         return;
     }
-    StaticJsonDocument<256> doc;
+    StaticJsonDocument<512> doc;
     DeserializationError err = deserializeJson(doc, data, len);
     if (err) { sendError(req, "Invalid JSON"); return; }
 
@@ -258,6 +258,27 @@ static void handleSetWifi(AsyncWebServerRequest* req, uint8_t* data, size_t len,
     sendOk(req, "connecting");
 }
 
+// ─── POST /api/wifi/scan ─────────────────────────────────────────────────────
+// Triggers a new WiFi scan (drops AP temporarily)
+static void handleWifiScanStart(AsyncWebServerRequest* req) {
+    if (wifiScanBusy()) {
+        sendJson(req, "{\"scanning\":true}");
+        return;
+    }
+    wifiStartScan();
+    sendOk(req, "scan_started");
+}
+
+// ─── GET /api/wifi/scan ──────────────────────────────────────────────────────
+// Returns cached scan results or scanning status
+static void handleWifiScanGet(AsyncWebServerRequest* req) {
+    if (wifiScanBusy()) {
+        sendJson(req, "{\"scanning\":true,\"networks\":[]}");
+        return;
+    }
+    sendJson(req, wifiScanResultsJson());
+}
+
 // ─── Registration ─────────────────────────────────────────────────────────────
 void registerApiRoutes(AsyncWebServer& server) {
     server.on("/api/status",     HTTP_GET,  handleGetStatus);
@@ -271,6 +292,8 @@ void registerApiRoutes(AsyncWebServer& server) {
     server.on("/api/save",       HTTP_POST, handleSave);
     server.on("/api/discard",    HTTP_POST, handleDiscard);
     server.on("/api/wifi",       HTTP_GET,  handleGetWifi);
+    server.on("/api/wifi/scan",  HTTP_GET,  handleWifiScanGet);
+    server.on("/api/wifi/scan",  HTTP_POST, handleWifiScanStart);
     server.on("/api/monitor",    HTTP_GET,  handleMonitorData);
     server.on("/api/monitor/start", HTTP_POST, handleMonitorStart);
     server.on("/api/monitor/stop",  HTTP_POST, handleMonitorStop);

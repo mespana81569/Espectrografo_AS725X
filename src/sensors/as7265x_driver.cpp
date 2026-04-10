@@ -59,12 +59,15 @@ SensorConfig AS7265xDriver::getConfig() const {
 bool AS7265xDriver::takeMeasurement(float* out18) {
     if (!_initialized) return false;
 
+    // Enable only the user-selected bulbs — we use takeMeasurements() (not
+    // takeMeasurementsWithBulb) so the library does NOT override our selection.
     if (_cfg.ledWhiteEnabled) _sensor.enableBulb(AS7265x_LED_WHITE);
     if (_cfg.ledIrEnabled)    _sensor.enableBulb(AS7265x_LED_IR);
     if (_cfg.ledUvEnabled)    _sensor.enableBulb(AS7265x_LED_UV);
 
-    _sensor.takeMeasurementsWithBulb();
+    _sensor.takeMeasurements();
 
+    // Always turn off all bulbs after reading
     _sensor.disableBulb(AS7265x_LED_WHITE);
     _sensor.disableBulb(AS7265x_LED_IR);
     _sensor.disableBulb(AS7265x_LED_UV);

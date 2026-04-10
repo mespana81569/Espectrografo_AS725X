@@ -35,7 +35,7 @@ private:
     bool _done;
     bool _failed;
     unsigned long _lastReadTime;
-    static const unsigned long READ_INTERVAL_MS = 300;
+    static const unsigned long READ_INTERVAL_MS = 500;
 };
 
 extern MeasurementEngine g_measurementEngine;

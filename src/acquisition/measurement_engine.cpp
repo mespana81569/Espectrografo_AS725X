@@ -24,8 +24,13 @@ void MeasurementEngine::start() {
     _experiment.count = 0;
     _experiment.timestamp = millis();
     _experiment.calibration = g_calibration.getData();
+    // Snapshot the ACTUAL sensor config at measurement time — this is what
+    // gets written to the CSV, so it always matches the hardware state.
+    _experiment.sensor_cfg = g_sensorDriver.getConfig();
     _lastReadTime = 0; // force immediate first read
-    Serial.printf("[Acq] Starting %d measurements\n", _targetN);
+    Serial.printf("[Acq] Starting %d measurements (gain=%u, int=%u)\n",
+                  _targetN, (uint8_t)_experiment.sensor_cfg.gain,
+                  _experiment.sensor_cfg.integrationCycles);
 }
 
 void MeasurementEngine::tick() {
@@ -62,8 +67,17 @@ bool MeasurementEngine::hasFailed() const { return _failed; }
 Experiment& MeasurementEngine::getExperiment() { return _experiment; }
 
 void MeasurementEngine::resetExperiment(const char* expId) {
+    // Preserve sensor_cfg and num_measurements across resets — only clear
+    // spectra data and counters.  The old code did memset(0) which wiped
+    // the config that configure() had just stored.
+    SensorConfig savedCfg = _experiment.sensor_cfg;
+    int savedN = _experiment.num_measurements;
+
     memset(&_experiment, 0, sizeof(_experiment));
     strncpy(_experiment.experiment_id, expId, sizeof(_experiment.experiment_id) - 1);
+
+    _experiment.sensor_cfg = savedCfg;
+    _experiment.num_measurements = savedN;
     _running = false;
     _done    = false;
     _failed  = false;

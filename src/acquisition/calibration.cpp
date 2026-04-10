@@ -5,9 +5,10 @@
 
 Calibration g_calibration;
 
-// Minimum gap between samples — sensor integration time at 50 cycles ≈ 140ms,
-// give it 200ms margin so the sensor has settled before the next read.
-static const unsigned long CAL_SAMPLE_INTERVAL_MS = 200;
+// Minimum gap between samples.  takeMeasurements() in Mode 3 blocks for
+// ~420 ms (50 cycles × 2.8 ms × 3 dies).  Add 500 ms on top so the sensor
+// registers have time to settle before the next one-shot trigger.
+static const unsigned long CAL_SAMPLE_INTERVAL_MS = 500;
 
 Calibration::Calibration()
     : _running(false), _done(false), _failed(false),

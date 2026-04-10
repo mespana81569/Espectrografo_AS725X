@@ -6,7 +6,7 @@
 #define SD_MOSI_PIN 23
 #define SD_MISO_PIN 19
 #define SD_SCK_PIN  18
-#define LOG_FILE    "/spectra_log.csv"
+#define LOG_FILE    "/spectra.csv"
 #define CAL_FILE    "/calibration.csv"
 
 class SDLogger {
@@ -15,18 +15,17 @@ public:
     bool begin();
     bool isReady() const;
 
-    // Save full experiment to SD (appends CSV rows)
+    // Save full experiment to SD (APPENDS CSV rows — never truncates)
     bool saveExperiment(const Experiment& exp);
 
     // Save calibration data to SD (overwrites previous)
     bool saveCalibration(const CalibrationData& cal);
 
-    // Write CSV header if file is new
+    // Write CSV header if file is new or empty
     bool ensureHeader();
 
 private:
     bool _ready;
-    bool writeRow(const char* line);
 };
 
 extern SDLogger g_sdLogger;

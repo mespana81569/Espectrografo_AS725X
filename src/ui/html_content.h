@@ -59,6 +59,15 @@ static const char HTML_CONTENT[] PROGMEM = R"rawhtml(
   /* Canvas */
   .cv{width:100%;height:240px;display:block}
   .hidden{display:none!important}
+
+  /* WiFi overlay */
+  #wifiPanel{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.85);
+    z-index:100;display:flex;align-items:center;justify-content:center}
+  #wifiBox{background:var(--card);border:1px solid var(--accent);border-radius:.8rem;
+    padding:1.2rem;width:90%;max-width:380px}
+  #wifiBox h2{color:var(--accent);font-size:1rem;margin-bottom:.7rem;text-align:center}
+  #wifiLog{font-size:.7rem;color:var(--muted);height:50px;overflow-y:auto;background:var(--bg);
+    border-radius:.3rem;padding:.3rem;border:1px solid var(--bdr);margin-top:.5rem;font-family:monospace}
 </style>
 </head>
 <body>
@@ -80,6 +89,7 @@ static const char HTML_CONTENT[] PROGMEM = R"rawhtml(
     <div class="row"><span class="d" id="dS"></span><span id="lS">Sensor: --</span></div>
     <div class="row"><span class="d" id="dD"></span><span id="lD">SD: --</span></div>
     <div class="row"><span class="d" id="dC"></span><span id="lC">Cal: --</span></div>
+    <div class="row"><span class="d" id="dW"></span><span id="lW">WiFi: --</span></div>
     <div class="bar"><div id="prog"></div></div>
     <div id="progL" style="font-size:.68rem;color:var(--muted);margin-top:.12rem">0 / 0</div>
 
@@ -94,10 +104,11 @@ static const char HTML_CONTENT[] PROGMEM = R"rawhtml(
     <h2 style="margin-top:.5rem">Diagnostics</h2>
     <button class="bA" id="bMon" onclick="monStart()">Live Monitor</button>
     <button class="bR" id="bMonStop" onclick="monStop()" disabled>Stop Monitor</button>
+    <button class="bA" id="bWifi" onclick="openWifi()">WiFi / Send to DB</button>
     <div id="log"></div>
   </div>
 
-  <!-- Config + WiFi -->
+  <!-- Config -->
   <div class="c">
     <h2>Configuration</h2>
     <label>Experiment ID</label>
@@ -117,17 +128,6 @@ static const char HTML_CONTENT[] PROGMEM = R"rawhtml(
     <div class="row"><input type="checkbox" id="ledU" style="width:auto"><label style="margin:0;display:inline">UV</label>
       <select id="ledUmA" style="width:5rem;margin-left:auto"><option value="12" selected>12.5</option><option value="25">25</option><option value="50">50</option><option value="100">100</option></select><span style="font-size:.7rem;color:var(--muted)">mA</span></div>
     <button class="bA" onclick="applyCfg()">Apply Config</button>
-
-    <h2 style="margin-top:.7rem">WiFi</h2>
-    <div class="row"><span class="d" id="dW"></span><span id="lW">--</span></div>
-    <label>Network</label>
-    <div class="row" style="gap:.3rem">
-      <select id="wSSID" style="flex:1"><option value="">-- Scan first --</option></select>
-      <button class="bA" style="width:auto;padding:.32rem .6rem;margin:0" onclick="scanWifi()" id="bScan">Scan</button>
-    </div>
-    <label>Password</label>
-    <input type="password" id="wPASS" placeholder="Password"/>
-    <button class="bA" onclick="connectWifi()">Connect</button>
   </div>
 
   <!-- Spectra chart -->
@@ -136,10 +136,29 @@ static const char HTML_CONTENT[] PROGMEM = R"rawhtml(
     <canvas id="chart" class="cv" height="240"></canvas>
   </div>
 
-  <!-- Live Monitor chart (separate) -->
+  <!-- Live Monitor chart -->
   <div class="c full hidden" id="liveCard">
     <h2>Live Monitor (real-time raw data)</h2>
     <canvas id="liveChart" class="cv" height="240"></canvas>
+  </div>
+</div>
+
+<!-- WiFi overlay panel (hidden by default) -->
+<div id="wifiPanel" class="hidden">
+  <div id="wifiBox">
+    <h2>WiFi Connection</h2>
+    <p style="font-size:.75rem;color:var(--muted);margin-bottom:.6rem;text-align:center">
+      Type the network name and password.<br>
+      The AP will drop while connecting.<br>
+      If it fails, <b>Espectrografo-AP</b> comes back.
+    </p>
+    <label>Network (SSID)</label>
+    <input type="text" id="wSSID" placeholder="Network name" autocomplete="off" spellcheck="false"/>
+    <label>Password</label>
+    <input type="password" id="wPASS" placeholder="Password"/>
+    <button class="bG" id="bConn" onclick="connectWifi()">Connect</button>
+    <button class="bR" onclick="closeWifi()" style="margin-top:.3rem">Close</button>
+    <div id="wifiLog"></div>
   </div>
 </div>
 
@@ -155,6 +174,13 @@ function lg(m){
   el.innerHTML+='<div>['+t+'] '+m+'</div>';
   el.scrollTop=el.scrollHeight;
 }
+function wlg(m){
+  var el=document.getElementById('wifiLog');
+  if(!el)return;
+  var t=new Date().toLocaleTimeString();
+  el.innerHTML+='<div>['+t+'] '+m+'</div>';
+  el.scrollTop=el.scrollHeight;
+}
 
 function api(path,method,body){
   return new Promise(function(ok){
@@ -162,9 +188,9 @@ function api(path,method,body){
       var o={method:method||'GET'};
       if(body){o.headers={'Content-Type':'application/json'};o.body=JSON.stringify(body);}
       fetch(path,o).then(function(r){return r.json();}).then(ok).catch(function(e){
-        lg('ERR: '+e.message);ok(null);
+        ok(null);
       });
-    }catch(e){lg('ERR: '+e.message);ok(null);}
+    }catch(e){ok(null);}
   });
 }
 
@@ -192,7 +218,7 @@ function updBtns(s){
   document.getElementById('b6').disabled      = s!=='SAVE_DECISION';
   document.getElementById('bMon').disabled    = !idle;
   document.getElementById('bMonStop').disabled= !live;
-  // Toggle chart sections
+  document.getElementById('bWifi').disabled   = !idle;
   document.getElementById('chartCard').classList.toggle('hidden',live);
   document.getElementById('liveCard').classList.toggle('hidden',!live);
 }
@@ -201,11 +227,9 @@ function updBtns(s){
 function act(a){
   api('/api/'+a,'POST').then(function(r){
     if(r)lg(a+': '+(r.status||r.error||'ok'));
-    // After a successful save, auto-increment experiment ID in the UI
     if(a==='save' && r && r.status==='saved'){
       var el=document.getElementById('expId');
       var v=el.value.trim();
-      // Try to increment trailing number: EXP_001 → EXP_002, Test3 → Test4
       var m=v.match(/^(.*?)(\d+)$/);
       if(m){
         var num=parseInt(m[2])+1;
@@ -241,58 +265,30 @@ function applyCfg(){
   });
 }
 
-function scanWifi(){
-  var btn=document.getElementById('bScan');
-  btn.disabled=true;btn.textContent='...';
-  lg('WiFi: scan starting (AP will drop briefly)...');
-  // POST triggers the scan — AP will go down, phone will disconnect
-  api('/api/wifi/scan','POST').then(function(){});
-  // AP is going down — we'll lose connection for ~10 seconds
-  lg('WiFi: AP offline for ~10s while scanning...');
-  // Poll for results after AP comes back (3s settle + 4s scan + 2s AP restore)
-  var attempts=0;
-  setTimeout(function pollScan(){
-    attempts++;
-    api('/api/wifi/scan').then(function(r){
-      if(!r||r.scanning){
-        // AP not back yet or still scanning — retry (up to 25 attempts = ~75s)
-        if(attempts<25){setTimeout(pollScan,3000);return;}
-        lg('WiFi: scan timeout — try again');
-        btn.disabled=false;btn.textContent='Scan';
-        return;
-      }
-      populateNetworks(r.networks);
-      btn.disabled=false;btn.textContent='Scan';
-    });
-  },10000);  // first poll after 10s
+/* ─── WiFi Panel ───────────────────────────────────────────────────────── */
+function openWifi(){
+  document.getElementById('wifiPanel').classList.remove('hidden');
+  wlg('Enter network name and password, then press Connect.');
 }
-
-function populateNetworks(nets){
-  var sel=document.getElementById('wSSID');
-  sel.innerHTML='';
-  if(!nets||nets.length===0){
-    sel.innerHTML='<option value="">No networks found</option>';
-    lg('WiFi: no networks found');
-    return;
-  }
-  // Sort by signal strength (already sorted by ESP32, but ensure)
-  nets.sort(function(a,b){return b.rssi-a.rssi;});
-  for(var i=0;i<nets.length;i++){
-    var o=document.createElement('option');
-    o.value=nets[i].ssid;
-    o.textContent=nets[i].ssid+' ('+nets[i].rssi+' dBm)'+(nets[i].enc?'':' [open]');
-    sel.appendChild(o);
-  }
-  lg('WiFi: found '+nets.length+' networks');
+function closeWifi(){
+  document.getElementById('wifiPanel').classList.add('hidden');
 }
 
 function connectWifi(){
-  var ssid=document.getElementById('wSSID').value;
+  var ssid=document.getElementById('wSSID').value.trim();
   var pass=document.getElementById('wPASS').value;
-  if(!ssid){lg('SSID required — press Scan first');return;}
-  lg('WiFi: connecting to '+ssid+'...');
+  if(!ssid){wlg('Enter the network name first.');return;}
+  var btn=document.getElementById('bConn');
+  btn.disabled=true; btn.textContent='Connecting...';
+  wlg('Sending credentials for: '+ssid);
+  wlg('AP will drop — check serial monitor for status.');
+  wlg('If it fails, reconnect to Espectrografo-AP.');
   api('/api/wifi','POST',{ssid:ssid,password:pass}).then(function(r){
-    if(r)lg('WiFi: '+(r.status||r.error));
+    if(r) wlg('ESP32: '+(r.status||r.error));
+    // Re-enable button after a delay — by then AP may be back or STA connected
+    setTimeout(function(){
+      btn.disabled=false; btn.textContent='Connect';
+    }, 20000);
   });
 }
 
@@ -316,7 +312,7 @@ function poll(){
   });
 }
 
-/* ─── Canvas Chart (no library) ─────────────────────────────────────────── */
+/* ─── Canvas Chart ─────────────────────────────────────────────────────── */
 function drawChart(data){
   var cv=document.getElementById('chart');
   if(!cv)return;
@@ -339,14 +335,12 @@ function drawChart(data){
   var L=48,R=12,T=18,B=26;
   var pW=W-L-R,pH=H-T-B;
 
-  /* grid */
   ctx.strokeStyle='#334155';ctx.lineWidth=0.5;
   for(var i=0;i<=4;i++){
     var y=T+pH*(1-i/4);
     ctx.beginPath();ctx.moveTo(L,y);ctx.lineTo(W-R,y);ctx.stroke();
   }
 
-  /* axis labels */
   ctx.fillStyle='#94a3b8';ctx.font='9px sans-serif';ctx.textAlign='center';
   for(var i=0;i<wl.length;i+=3){
     var x=L+(i/(wl.length-1))*pW;
@@ -358,7 +352,6 @@ function drawChart(data){
     ctx.fillText((mx*i/4).toFixed(1),L-4,y+3);
   }
 
-  /* lines + dots */
   var clr=['#38bdf8','#a78bfa','#34d399'];
   for(var s=0;s<sp.length;s++){
     ctx.strokeStyle=clr[s%3];ctx.lineWidth=2;ctx.beginPath();
@@ -376,7 +369,6 @@ function drawChart(data){
     }
   }
 
-  /* legend */
   ctx.font='10px sans-serif';ctx.textAlign='left';
   for(var s=0;s<sp.length;s++){
     var lx=L+4+s*80;
@@ -400,7 +392,6 @@ function monStop(){
   });
 }
 
-/* wavelength→colour for bar chart */
 function wlClr(nm){
   if(nm<450)return'#8b5cf6';if(nm<500)return'#3b82f6';if(nm<560)return'#22c55e';
   if(nm<600)return'#eab308';if(nm<650)return'#f97316';if(nm<750)return'#ef4444';
@@ -430,21 +421,18 @@ function drawLive(data){
   var bw=pW/ch.length*0.7;
   var gap=pW/ch.length;
 
-  /* grid */
   ctx.strokeStyle='#334155';ctx.lineWidth=0.5;
   for(var i=0;i<=4;i++){
     var y=T+pH*(1-i/4);
     ctx.beginPath();ctx.moveTo(L,y);ctx.lineTo(W-R,y);ctx.stroke();
   }
 
-  /* Y labels */
   ctx.fillStyle='#94a3b8';ctx.font='9px sans-serif';ctx.textAlign='right';
   for(var i=0;i<=4;i++){
     var y=T+pH*(1-i/4);
     ctx.fillText((mx*i/4).toFixed(1),L-4,y+3);
   }
 
-  /* bars + X labels */
   var names='ABCDEFGHIJKLRSTUVW';
   ctx.textAlign='center';
   for(var i=0;i<ch.length;i++){
@@ -452,7 +440,6 @@ function drawLive(data){
     var h=ch[i]/mx*pH;
     ctx.fillStyle=wlClr(wl[i]);
     ctx.fillRect(x,T+pH-h,bw,h);
-    /* label */
     ctx.fillStyle='#94a3b8';ctx.font='8px sans-serif';
     ctx.fillText(wl[i],L+gap*i+gap/2,H-14);
     ctx.fillText(names[i],L+gap*i+gap/2,H-4);
@@ -467,7 +454,7 @@ function monitorLoop(){
   setTimeout(monitorLoop,600);
 }
 
-/* ─── Self-scheduling loops (never overlap) ─────────────────────────────── */
+/* ─── Self-scheduling loops ────────────────────────────────────────────── */
 function statusLoop(){
   poll();
   var fast=(cur==='CALIBRATION'||cur==='MEASUREMENT'||cur==='LIVE_MONITOR');
@@ -484,26 +471,35 @@ function spectraLoop(){
 var lastWifiSt='';
 function wifiLoop(){
   api('/api/wifi').then(function(r){
-    if(!r)return;
+    if(!r){setTimeout(wifiLoop,3000);return;}
     var st=r.status||'';
     var ok=st.indexOf('connected:')===0;
-    var cls=ok?'ok':(st==='connecting'?'wa':'er');
-    if(st==='not_configured')cls='';
+    var cls=ok?'ok':(st==='connecting'?'wa':'');
     document.getElementById('dW').className='d '+cls;
-    document.getElementById('lW').textContent=ok?st.replace('connected:','IP: '):st;
+    document.getElementById('lW').textContent='WiFi: '+(ok?st.replace('connected:','IP '):st);
     if(st!==lastWifiSt){
-      if(ok)lg('WiFi connected: '+st.replace('connected:',''));
-      else if(st==='failed')lg('WiFi connection failed');
-      else if(st==='ssid_not_found')lg('WiFi SSID not found');
-      else if(st==='connecting')lg('WiFi connecting...');
       lastWifiSt=st;
+      if(ok){
+        var ip=st.replace('connected:','');
+        lg('WiFi connected: '+ip);
+        wlg('Connected! IP: '+ip);
+        closeWifi();
+      } else if(st==='failed'){
+        lg('WiFi failed'); wlg('Failed. AP is back — try again.');
+      } else if(st==='ssid_not_found'){
+        lg('SSID not found'); wlg('SSID not found. AP is back — try again.');
+      } else if(st==='disconnected'){
+        lg('WiFi disconnected'); wlg('Disconnected. AP is back — try again.');
+      } else if(st==='connecting'){
+        lg('WiFi connecting...');
+      }
     }
   });
   setTimeout(wifiLoop,3000);
 }
 
 /* ─── Boot ──────────────────────────────────────────────────────────────── */
-lg('UI ready (standalone, no CDN)');
+lg('UI ready');
 statusLoop();
 setTimeout(spectraLoop,400);
 setTimeout(wifiLoop,900);

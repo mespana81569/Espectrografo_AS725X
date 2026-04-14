@@ -259,24 +259,28 @@ static void handleSetWifi(AsyncWebServerRequest* req, uint8_t* data, size_t len,
 }
 
 // ─── POST /api/wifi/scan ─────────────────────────────────────────────────────
-// Triggers a new WiFi scan (drops AP temporarily)
+// Triggers a scan from loop() — AP will drop, phone will disconnect briefly
 static void handleWifiScanStart(AsyncWebServerRequest* req) {
-    if (wifiScanBusy()) {
-        sendJson(req, "{\"scanning\":true}");
+    if (wifiScanInProgress()) {
+        sendJson(req, "{\"status\":\"already_scanning\"}");
         return;
     }
-    wifiStartScan();
+    wifiRequestScan();
     sendOk(req, "scan_started");
 }
 
 // ─── GET /api/wifi/scan ──────────────────────────────────────────────────────
-// Returns cached scan results or scanning status
+// Returns scan state + cached results
 static void handleWifiScanGet(AsyncWebServerRequest* req) {
-    if (wifiScanBusy()) {
-        sendJson(req, "{\"scanning\":true,\"networks\":[]}");
+    if (wifiScanInProgress()) {
+        sendJson(req, "{\"scanning\":true}");
         return;
     }
-    sendJson(req, wifiScanResultsJson());
+    if (wifiScanHasResults()) {
+        sendJson(req, wifiScanResultsJson());
+        return;
+    }
+    sendJson(req, "{\"scanning\":false,\"networks\":[]}");
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────

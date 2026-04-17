@@ -5,6 +5,7 @@
 #include "acquisition/calibration.h"
 #include "storage/sd_logger.h"
 #include "web/web_server.h"
+#include "mqtt/mqtt_client.h"
 
 // Live monitor shared buffer — read by GET /api/monitor
 float    g_liveBuf[18] = {0};
@@ -32,6 +33,9 @@ void setup() {
 
     // Start Wi-Fi AP + HTTP server
     webServerSetup();
+
+    // MQTT client — connects in tick() once STA link is up.
+    g_mqttClient.begin();
 
     Serial.println("[Boot] System ready");
 }
@@ -65,4 +69,7 @@ void loop() {
 
     // Periodic web tasks (WiFi STA connection state machine)
     webServerLoop();
+
+    // MQTT: reconnect, pump protocol, process commands, drive bulk upload.
+    g_mqttClient.tick();
 }

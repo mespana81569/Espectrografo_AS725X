@@ -3,6 +3,7 @@
 #include "../acquisition/measurement_engine.h"
 #include "../acquisition/calibration.h"
 #include "../storage/sd_logger.h"
+#include "../mqtt/mqtt_client.h"
 #include <Arduino.h>
 
 StateMachine g_stateMachine;
@@ -35,6 +36,22 @@ const char* StateMachine::getStateName() const {
 }
 
 void StateMachine::enterState(SystemState s) {
+    // Broadcast state to MQTT subscribers (no-op if broker not connected).
+    if (g_mqttClient.isConnected()) {
+        const char* name;
+        switch (s) {
+            case SystemState::IDLE:              name = "IDLE"; break;
+            case SystemState::CALIBRATION:       name = "CALIBRATION"; break;
+            case SystemState::WAIT_CONFIRMATION: name = "WAIT_CONFIRMATION"; break;
+            case SystemState::MEASUREMENT:       name = "MEASUREMENT"; break;
+            case SystemState::VALIDATION:        name = "VALIDATION"; break;
+            case SystemState::SAVE_DECISION:     name = "SAVE_DECISION"; break;
+            case SystemState::LIVE_MONITOR:      name = "LIVE_MONITOR"; break;
+            default:                             name = "UNKNOWN"; break;
+        }
+        g_mqttClient.publishState(name);
+    }
+
     switch (s) {
         case SystemState::IDLE:
             g_sensorDriver.setSleepMode(true);

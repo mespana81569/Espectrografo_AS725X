@@ -246,9 +246,13 @@ void webServerLoop() {
     if (s_connecting) {
         wl_status_t st = WiFi.status();
         if (st == WL_CONNECTED) {
-            // Success
+            // Success — finalise teardown of the AP and come back online on STA.
             s_connecting = false;
-            Serial.printf("[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+            WiFi.softAPdisconnect(true);   // make the AP gone for good
+            WiFi.mode(WIFI_STA);            // STA-only
+            g_httpServer.begin();           // bring REST API back on STA IP
+            Serial.printf("[WiFi] Connected! IP: %s — AP torn down, HTTP re-listening\n",
+                          WiFi.localIP().toString().c_str());
             configTime(0, 0, "pool.ntp.org", "time.nist.gov");
             Serial.println("[WiFi] NTP sync requested");
         } else if ((millis() - s_connectStart) > CONNECT_TIMEOUT_MS) {

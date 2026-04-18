@@ -1,0 +1,845 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Spectrograph AS7265X &mdash; Remote Control</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.1.0/paho-mqtt.min.js"></script>
+<style>
+  :root{--bg:#0f172a;--card:#1e293b;--bdr:#334155;--accent:#38bdf8;--accent2:#a78bfa;
+    --ok:#4ade80;--danger:#f87171;--warn:#fbbf24;--text:#e2e8f0;--muted:#94a3b8}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);
+    min-height:100vh;padding:.75rem}
+  h1{text-align:center;color:var(--accent);font-size:1.3rem;margin-bottom:.6rem;letter-spacing:.05em}
+
+  /* MQTT status bar */
+  .mqbar{display:flex;flex-wrap:wrap;gap:.9rem;align-items:center;justify-content:center;
+    background:var(--card);border:1px solid var(--bdr);border-radius:.55rem;
+    padding:.45rem .75rem;margin:0 auto .7rem;max-width:900px;font-size:.75rem}
+  .mqbar .seg{display:flex;align-items:center;gap:.35rem}
+  .mqbar .lab{color:var(--muted)}
+  .badge{padding:.15rem .45rem;border-radius:.3rem;background:var(--bdr);color:var(--text);
+    font-size:.68rem;font-weight:700;letter-spacing:.04em}
+  .badge.on{background:var(--accent);color:var(--bg)}
+  .banner{background:var(--danger);color:var(--bg);padding:.45rem;text-align:center;
+    border-radius:.45rem;margin:0 auto .6rem;max-width:900px;font-size:.78rem;font-weight:600}
+
+  /* Pipeline */
+  .pipe{display:flex;align-items:center;justify-content:center;gap:0;margin-bottom:.75rem;flex-wrap:wrap}
+  .stp{padding:.3rem .55rem;font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;
+    background:var(--bdr);color:var(--muted);border-radius:.3rem;white-space:nowrap;transition:all .3s}
+  .stp.on{background:var(--accent);color:var(--bg);animation:pulse 1.5s ease-in-out infinite}
+  .stp.ok{background:var(--ok);color:var(--bg)}
+  .arr{color:var(--bdr);font-size:.85rem;padding:0 .15rem}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.65}}
+
+  /* Grid */
+  .g{display:grid;grid-template-columns:1fr 1fr;gap:.7rem;max-width:900px;margin:0 auto}
+  @media(max-width:600px){.g{grid-template-columns:1fr}}
+  .c{background:var(--card);border-radius:.7rem;padding:.8rem;border:1px solid var(--bdr)}
+  .c h2{font-size:.75rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin-bottom:.45rem}
+  .full{grid-column:1/-1}
+
+  /* Form */
+  label{display:block;font-size:.72rem;color:var(--muted);margin:.35rem 0 .1rem}
+  select,input{width:100%;padding:.32rem .45rem;background:var(--bg);border:1px solid var(--bdr);
+    border-radius:.3rem;color:var(--text);font-size:.82rem}
+  button{width:100%;padding:.45rem;margin-top:.35rem;border:none;border-radius:.3rem;
+    cursor:pointer;font-size:.78rem;font-weight:600;transition:all .15s}
+  button:hover:not(:disabled){opacity:.85}
+  button:disabled{opacity:.3;cursor:not-allowed}
+  .bA{background:var(--accent);color:var(--bg)}
+  .bG{background:var(--ok);color:var(--bg)}
+  .bR{background:var(--danger);color:var(--bg)}
+  .bP{background:var(--accent2);color:var(--bg)}
+
+  /* Status */
+  .row{display:flex;gap:.35rem;align-items:center;margin-bottom:.2rem;font-size:.8rem}
+  .d{width:.5rem;height:.5rem;border-radius:50%;background:var(--bdr);flex-shrink:0}
+  .d.ok{background:var(--ok)}.d.er{background:var(--danger)}.d.wa{background:var(--warn)}
+  .bar{height:.3rem;background:var(--bdr);border-radius:.15rem;overflow:hidden;margin-top:.25rem}
+  .bar>div{height:100%;background:var(--accent);width:0%;transition:width .3s}
+
+  /* Log */
+  #log{font-size:.65rem;color:var(--muted);height:65px;overflow-y:auto;background:var(--bg);
+    border-radius:.3rem;padding:.3rem;border:1px solid var(--bdr);margin-top:.35rem;font-family:monospace}
+
+  /* Canvas */
+  .cv{width:100%;height:240px;display:block}
+  .cvBig{width:100%;height:320px;display:block}
+  .hidden{display:none!important}
+
+  /* History panel */
+  .hist{max-width:1200px;margin:.9rem auto 0}
+  .tabs{display:flex;gap:.3rem;border-bottom:1px solid var(--bdr);margin-bottom:.6rem}
+  .tab{padding:.5rem .9rem;background:transparent;border:none;color:var(--muted);
+    cursor:pointer;font-size:.78rem;font-weight:600;border-bottom:2px solid transparent;
+    margin:0;width:auto;border-radius:0}
+  .tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+  .pane{display:none}
+  .pane.active{display:block}
+  table{width:100%;border-collapse:collapse;font-size:.72rem}
+  th,td{padding:.35rem .4rem;text-align:left;border-bottom:1px solid var(--bdr);white-space:nowrap}
+  th{color:var(--muted);text-transform:uppercase;font-size:.65rem;letter-spacing:.05em;background:var(--bg)}
+  tr:hover td{background:rgba(56,189,248,.05)}
+  .pill{padding:.1rem .4rem;border-radius:.3rem;font-size:.65rem;font-weight:700}
+  .pill.ok{background:var(--ok);color:var(--bg)}
+  .pill.er{background:var(--danger);color:var(--bg)}
+  .toolbar{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;margin-bottom:.5rem}
+  .toolbar button{width:auto;margin:0;padding:.35rem .7rem;font-size:.72rem}
+  .toolbar select,.toolbar input{width:auto;display:inline-block}
+  .spin{display:inline-block;width:14px;height:14px;border:2px solid var(--bdr);
+    border-top-color:var(--accent);border-radius:50%;animation:spn 1s linear infinite;vertical-align:middle}
+  @keyframes spn{to{transform:rotate(360deg)}}
+  .scroll{max-height:420px;overflow:auto;border:1px solid var(--bdr);border-radius:.4rem}
+  .tblRaw{font-size:.65rem}
+  .tblRaw td,.tblRaw th{padding:.2rem .3rem;font-family:monospace}
+  .measCheckList{display:flex;flex-wrap:wrap;gap:.35rem;margin:.45rem 0}
+  .measCheckList label{display:flex;align-items:center;gap:.25rem;font-size:.7rem;color:var(--text);
+    background:var(--bg);border:1px solid var(--bdr);padding:.2rem .45rem;border-radius:.3rem;cursor:pointer;margin:0}
+  .measCheckList input{width:auto;margin:0}
+  .muted{color:var(--muted);font-size:.72rem}
+  .sz{color:var(--accent);font-size:.72rem;margin-left:.4rem}
+</style>
+</head>
+<body>
+<h1>Portable Spectrograph &mdash; AS7265X (Remote)</h1>
+
+<div id="banner" class="banner hidden">MQTT disconnected &mdash; commands unavailable</div>
+
+<div class="mqbar">
+  <div class="seg"><span class="d" id="mqDot"></span><span class="lab">Broker:</span><span id="mqTxt">--</span></div>
+  <div class="seg"><span class="d" id="espDot"></span><span class="lab">ESP32:</span><span id="espTxt">--</span></div>
+  <div class="seg"><span class="lab">State:</span><span class="badge" id="stBadge">---</span></div>
+  <div class="seg"><span class="lab">RSSI:</span><span id="rssiTxt">--</span></div>
+  <div class="seg"><span class="lab">Heap:</span><span id="heapTxt">--</span></div>
+  <div class="seg"><span class="lab">Uploads:</span><span id="upTxt">0</span></div>
+</div>
+
+<div class="pipe" id="pipe">
+  <div class="stp on" data-s="IDLE">1. Idle</div><div class="arr">&rsaquo;</div>
+  <div class="stp" data-s="CALIBRATION">2. Calibrating</div><div class="arr">&rsaquo;</div>
+  <div class="stp" data-s="WAIT_CONFIRMATION">3. Confirm</div><div class="arr">&rsaquo;</div>
+  <div class="stp" data-s="MEASUREMENT">4. Measuring</div><div class="arr">&rsaquo;</div>
+  <div class="stp" data-s="VALIDATION">5. Validate</div><div class="arr">&rsaquo;</div>
+  <div class="stp" data-s="SAVE_DECISION">6. Save</div>
+</div>
+
+<div class="g">
+  <div class="c">
+    <h2>Status</h2>
+    <div class="row"><span class="d" id="dS"></span><span id="lS">Sensor: --</span></div>
+    <div class="row"><span class="d" id="dD"></span><span id="lD">SD: --</span></div>
+    <div class="row"><span class="d" id="dC"></span><span id="lC">Cal: --</span></div>
+    <div class="row"><span class="d" id="dW"></span><span id="lW">WiFi: --</span></div>
+    <div class="row"><span class="d" id="dM"></span><span id="lM">MQTT: --</span></div>
+    <div class="bar"><div id="prog"></div></div>
+    <div id="progL" style="font-size:.68rem;color:var(--muted);margin-top:.12rem">0 / 0</div>
+
+    <h2 style="margin-top:.5rem">Control</h2>
+    <button class="bP" id="b1" onclick="act('calibrate')">1. Calibrate (blank reference)</button>
+    <button class="bA" id="b2" onclick="act('confirm')" disabled>2. Sample Inserted &mdash; Confirm</button>
+    <button class="bG" id="b3" onclick="act('measure')" disabled>3. Start Measurement</button>
+    <button class="bA" id="b4" onclick="act('accept')" disabled>4. Accept Results</button>
+    <button class="bG" id="b5" onclick="act('save')" disabled>5. Save to SD</button>
+    <button class="bR" id="b6" onclick="act('discard')" disabled>Discard</button>
+
+    <h2 style="margin-top:.5rem">Diagnostics</h2>
+    <button class="bA" id="bMon" onclick="monStart()">Live Monitor</button>
+    <button class="bR" id="bMonStop" onclick="monStop()" disabled>Stop Monitor</button>
+    <div id="log"></div>
+  </div>
+
+  <div class="c">
+    <h2>Configuration</h2>
+    <label>Experiment ID</label>
+    <input type="text" id="expId" value="EXP_001"/>
+    <label>Gain</label>
+    <select id="gain"><option value="0">1x</option><option value="1">4x</option>
+      <option value="2" selected>16x</option><option value="3">64x</option></select>
+    <label>Integration (cycles, 1 = 2.8 ms)</label>
+    <input type="number" id="intCycles" value="50" min="1" max="255"/>
+    <label>Measurements (N, max 20)</label>
+    <input type="number" id="measN" value="5" min="1" max="20"/>
+    <h2 style="margin-top:.5rem">LED Bulbs</h2>
+    <div class="row"><input type="checkbox" id="ledW" style="width:auto"><label style="margin:0;display:inline">White (VIS)</label>
+      <select id="ledWmA" style="width:5rem;margin-left:auto"><option value="12" selected>12.5</option><option value="25">25</option><option value="50">50</option><option value="100">100</option></select><span style="font-size:.7rem;color:var(--muted)">mA</span></div>
+    <div class="row"><input type="checkbox" id="ledI" style="width:auto"><label style="margin:0;display:inline">IR (NIR)</label>
+      <select id="ledImA" style="width:5rem;margin-left:auto"><option value="12" selected>12.5</option><option value="25">25</option><option value="50">50</option><option value="100">100</option></select><span style="font-size:.7rem;color:var(--muted)">mA</span></div>
+    <div class="row"><input type="checkbox" id="ledU" style="width:auto"><label style="margin:0;display:inline">UV</label>
+      <select id="ledUmA" style="width:5rem;margin-left:auto"><option value="12" selected>12.5</option><option value="25">25</option><option value="50">50</option><option value="100">100</option></select><span style="font-size:.7rem;color:var(--muted)">mA</span></div>
+    <button class="bA" onclick="applyCfg()">Apply Config</button>
+  </div>
+
+  <div class="c full" id="chartCard">
+    <h2>Spectra (last 3 measurements)</h2>
+    <canvas id="chart" class="cv" height="240"></canvas>
+  </div>
+
+  <div class="c full hidden" id="liveCard">
+    <h2>Live Monitor (real-time raw data)</h2>
+    <canvas id="liveChart" class="cv" height="240"></canvas>
+  </div>
+</div>
+
+<div class="hist">
+  <div class="tabs">
+    <button class="tab active" data-tab="exp" onclick="showTab('exp')">Experiments</button>
+    <button class="tab" data-tab="spv" onclick="showTab('spv')">Spectra Viewer</button>
+    <button class="tab" data-tab="exp2" onclick="showTab('exp2')">Export</button>
+  </div>
+
+  <div class="pane active" id="pane_exp">
+    <div class="c">
+      <div class="toolbar">
+        <button class="bA" onclick="loadExperiments(true)">Refresh</button>
+        <button class="bA" id="pgPrev" onclick="pgMove(-1)">&laquo; Prev</button>
+        <button class="bA" id="pgNext" onclick="pgMove(1)">Next &raquo;</button>
+        <span class="muted" id="pgInfo">&mdash;</span>
+        <span id="expSpin" class="spin hidden"></span>
+      </div>
+      <div class="scroll">
+        <table id="expTbl">
+          <thead><tr>
+            <th>Exp ID</th><th>Date/Time</th><th>N</th><th>Gain</th><th>Int</th>
+            <th>White mA</th><th>IR mA</th><th>UV mA</th><th>Cal</th><th></th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="pane" id="pane_spv">
+    <div class="c">
+      <div class="toolbar">
+        <label style="margin:0">Experiment:</label>
+        <select id="spvSel" style="min-width:180px"></select>
+        <button class="bA" onclick="loadSpectra()">Load</button>
+        <span id="spvSpin" class="spin hidden"></span>
+      </div>
+      <canvas id="spvChart" class="cvBig" height="320"></canvas>
+      <div class="measCheckList" id="spvChecks"></div>
+      <div class="scroll" style="margin-top:.5rem">
+        <table class="tblRaw" id="spvTbl">
+          <thead><tr id="spvHead"></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="pane" id="pane_exp2">
+    <div class="c">
+      <h2>Export Data</h2>
+      <label>Experiment</label>
+      <select id="exSel" style="max-width:300px"></select>
+      <div class="row" style="margin-top:.4rem">
+        <input type="checkbox" id="exAll" style="width:auto"/>
+        <label style="margin:0;display:inline">Export all experiments</label>
+      </div>
+      <div class="toolbar" style="margin-top:.6rem">
+        <button class="bG" onclick="doExport('csv')">Download CSV</button>
+        <button class="bA" onclick="doExport('json')">Download JSON</button>
+        <span class="sz" id="exSz"></span>
+      </div>
+      <p class="muted" style="margin-top:.5rem">CSV contains one row per measurement. JSON contains full experiment metadata, calibration offsets, and spectra.</p>
+    </div>
+  </div>
+</div>
+
+<script>
+var MQTT_HOST = "localhost";
+var MQTT_PORT = 1884;
+var MQTT_CLIENT_ID = "control_" + Math.random().toString(16).substr(2,8);
+
+var WAVELENGTHS = [410,435,460,485,510,535,560,585,610,645,680,705,730,760,810,860,900,940];
+
+var ST = ['IDLE','CALIBRATION','WAIT_CONFIRMATION','MEASUREMENT','VALIDATION','SAVE_DECISION'];
+var cur = 'IDLE';
+var lastStatus = null;
+var uploadCount = 0;
+var mqttConnected = false;
+var client = null;
+var reconnectTimer = null;
+
+function lg(m){
+  var el=document.getElementById('log');
+  if(!el)return;
+  var t=new Date().toLocaleTimeString();
+  el.innerHTML+='<div>['+t+'] '+m+'</div>';
+  el.scrollTop=el.scrollHeight;
+  var lines=el.querySelectorAll('div');
+  if(lines.length>200) lines[0].remove();
+}
+
+function setMqttUI(conn){
+  mqttConnected = conn;
+  var dot=document.getElementById('mqDot');
+  var txt=document.getElementById('mqTxt');
+  dot.className='d '+(conn?'ok':'er');
+  txt.textContent=conn?'connected':'disconnected';
+  document.getElementById('banner').classList.toggle('hidden', conn);
+  document.getElementById('dM').className='d '+(conn?'ok':'er');
+  document.getElementById('lM').textContent='MQTT: '+(conn?'OK':'--');
+  updBtns(cur);
+}
+
+function connectMQTT(){
+  try{
+    client = new Paho.Client(MQTT_HOST, MQTT_PORT, MQTT_CLIENT_ID);
+    client.onConnectionLost = function(r){
+      lg('MQTT lost: '+(r.errorMessage||'unknown'));
+      setMqttUI(false);
+      scheduleReconnect();
+    };
+    client.onMessageArrived = onMqttMessage;
+    client.connect({
+      onSuccess: onMQTTConnect,
+      useSSL: false,
+      onFailure: onMQTTFail,
+      keepAliveInterval: 30
+    });
+  }catch(e){
+    lg('MQTT connect error: '+e.message);
+    scheduleReconnect();
+  }
+}
+
+function scheduleReconnect(){
+  if(reconnectTimer) return;
+  reconnectTimer = setTimeout(function(){
+    reconnectTimer=null;
+    lg('MQTT reconnecting...');
+    connectMQTT();
+  }, 5000);
+}
+
+function onMQTTConnect(){
+  lg('MQTT connected to '+MQTT_HOST+':'+MQTT_PORT);
+  setMqttUI(true);
+  client.subscribe('esp32/data/state');
+  client.subscribe('esp32/data/status');
+  client.subscribe('esp32/data/spectra');
+  client.subscribe('esp32/data/upload');
+  client.subscribe('esp32/data/#');
+}
+
+function onMQTTFail(e){
+  lg('MQTT fail: '+(e.errorMessage||'unknown'));
+  setMqttUI(false);
+  scheduleReconnect();
+}
+
+function pubCmd(topic, payload){
+  if(!mqttConnected){ lg('MQTT not connected — cannot send '+topic); return; }
+  try{
+    var msg = new Paho.Message(payload==null?"":payload);
+    msg.destinationName = topic;
+    client.send(msg);
+  }catch(e){ lg('publish err: '+e.message); }
+}
+
+function onMqttMessage(m){
+  var topic = m.destinationName;
+  var pl = m.payloadString;
+  var data = null;
+  try{ data = JSON.parse(pl); }catch(e){}
+
+  if(topic === 'esp32/data/state'){
+    if(data && data.state){
+      cur = data.state;
+      lastStatus = Object.assign(lastStatus||{}, data);
+      updPipe(cur);
+      updBtns(cur);
+      updStateBadge(cur);
+      updStatusCards(lastStatus);
+    }
+  } else if(topic === 'esp32/data/status'){
+    if(data){
+      lastStatus = Object.assign(lastStatus||{}, data);
+      if(data.state){ cur=data.state; updPipe(cur); updBtns(cur); updStateBadge(cur); }
+      document.getElementById('espDot').className='d ok';
+      document.getElementById('espTxt').textContent=new Date().toLocaleTimeString();
+      if(data.rssi!=null) document.getElementById('rssiTxt').textContent=data.rssi+' dBm';
+      if(data.heap!=null) document.getElementById('heapTxt').textContent=Math.round(data.heap/1024)+' KB';
+      updStatusCards(lastStatus);
+    }
+  } else if(topic === 'esp32/data/spectra'){
+    if(data && data.spectra){
+      drawChart(data);
+      setTimeout(function(){ loadExperiments(false); }, 800);
+    }
+  } else if(topic === 'esp32/data/upload'){
+    uploadCount++;
+    document.getElementById('upTxt').textContent=uploadCount;
+    lg('Upload: '+(data && data.exp_id ? data.exp_id : pl));
+    setTimeout(function(){ loadExperiments(false); }, 500);
+  } else if(topic === 'esp32/data/monitor'){
+    if(data) drawLive(data);
+  } else {
+    if(topic.indexOf('esp32/data/')===0){
+      var sub=topic.substr(11);
+      if(sub!=='state' && sub!=='status' && sub!=='spectra' && sub!=='upload')
+        lg(sub+': '+pl.substr(0,80));
+    }
+  }
+}
+
+function updStateBadge(s){
+  var b=document.getElementById('stBadge');
+  b.textContent=s;
+  b.className='badge'+(s==='IDLE'?'':' on');
+}
+
+function updStatusCards(s){
+  if(!s) return;
+  var sd=function(id,ok){document.getElementById(id).className='d '+(ok?'ok':'er');};
+  if(s.sensorReady!=null){ sd('dS',s.sensorReady); document.getElementById('lS').textContent='Sensor: '+(s.sensorReady?'OK':'--'); }
+  if(s.sdReady!=null){ sd('dD',s.sdReady); document.getElementById('lD').textContent='SD: '+(s.sdReady?'OK':'--'); }
+  if(s.calValid!=null){ sd('dC',s.calValid); document.getElementById('lC').textContent='Cal: '+(s.calValid?'Valid':'--'); }
+  if(s.wifi!=null){
+    var ok = s.wifi==='connected' || (typeof s.wifi==='string' && s.wifi.indexOf('connected')===0);
+    document.getElementById('dW').className='d '+(ok?'ok':'er');
+    document.getElementById('lW').textContent='WiFi: '+s.wifi;
+  }
+  var tgt=s.measTarget||0, cnt=s.measCount||0;
+  var pct=tgt>0?(cnt/tgt*100):0;
+  document.getElementById('prog').style.width=pct+'%';
+  document.getElementById('progL').textContent=cnt+' / '+tgt;
+}
+
+function updPipe(state){
+  var steps=document.querySelectorAll('.stp');
+  var idx=-1;
+  for(var i=0;i<ST.length;i++){if(ST[i]===state)idx=i;}
+  for(var i=0;i<steps.length;i++){
+    steps[i].classList.remove('on','ok');
+    if(i<idx)steps[i].classList.add('ok');
+    else if(i===idx)steps[i].classList.add('on');
+  }
+}
+
+function updBtns(s){
+  var idle=s==='IDLE';
+  var live=s==='LIVE_MONITOR';
+  var on=mqttConnected;
+  document.getElementById('b1').disabled      = !on || !idle;
+  document.getElementById('b2').disabled      = !on || s!=='WAIT_CONFIRMATION';
+  document.getElementById('b3').disabled      = !on || (s!=='WAIT_CONFIRMATION' && !idle);
+  document.getElementById('b4').disabled      = !on || s!=='VALIDATION';
+  document.getElementById('b5').disabled      = !on || s!=='SAVE_DECISION';
+  document.getElementById('b6').disabled      = !on || s!=='SAVE_DECISION';
+  document.getElementById('bMon').disabled    = !on || !idle;
+  document.getElementById('bMonStop').disabled= !on || !live;
+  document.getElementById('chartCard').classList.toggle('hidden',live);
+  document.getElementById('liveCard').classList.toggle('hidden',!live);
+}
+
+function act(a){
+  pubCmd('esp32/cmd/'+a, '');
+  lg('> '+a);
+  if(a==='save'){
+    var el=document.getElementById('expId');
+    var v=el.value.trim();
+    var m=v.match(/^(.*?)(\d+)$/);
+    if(m){
+      var num=parseInt(m[2])+1;
+      var pad=m[2].length;
+      var ns=String(num);
+      while(ns.length<pad)ns='0'+ns;
+      el.value=m[1]+ns;
+    } else {
+      el.value=v+'_2';
+    }
+    lg('Next experiment: '+el.value);
+  }
+}
+
+function applyCfg(){
+  var cfg={
+    gain:parseInt(document.getElementById('gain').value),
+    integrationCycles:parseInt(document.getElementById('intCycles').value),
+    mode:3,
+    ledWhiteCurrent:parseInt(document.getElementById('ledWmA').value),
+    ledIrCurrent:parseInt(document.getElementById('ledImA').value),
+    ledUvCurrent:parseInt(document.getElementById('ledUmA').value),
+    ledWhiteEnabled:document.getElementById('ledW').checked,
+    ledIrEnabled:document.getElementById('ledI').checked,
+    ledUvEnabled:document.getElementById('ledU').checked,
+    N:parseInt(document.getElementById('measN').value),
+    expId:document.getElementById('expId').value.trim()||'EXP_001'
+  };
+  pubCmd('esp32/cmd/config', JSON.stringify(cfg));
+  lg('> config applied');
+}
+
+function monStart(){ pubCmd('esp32/cmd/monitor/start',''); lg('> monitor start'); }
+function monStop(){ pubCmd('esp32/cmd/monitor/stop',''); lg('> monitor stop'); }
+
+/* chart drawing — mirrors html_content.h */
+function drawChartOn(cvId, spectra, wavelengths, labels, offsets){
+  var cv=document.getElementById(cvId);
+  if(!cv) return;
+  var ctx=cv.getContext('2d');
+  var rect=cv.getBoundingClientRect();
+  var dpr=window.devicePixelRatio||1;
+  cv.width=rect.width*dpr; cv.height=rect.height*dpr;
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.scale(dpr,dpr);
+  var W=rect.width, H=rect.height;
+  ctx.clearRect(0,0,W,H);
+
+  if(!spectra || !spectra.length || !wavelengths || !wavelengths.length) return;
+
+  var mx=0;
+  for(var i=0;i<spectra.length;i++) for(var j=0;j<spectra[i].length;j++) if(spectra[i][j]>mx) mx=spectra[i][j];
+  if(offsets) for(var j=0;j<offsets.length;j++) if(offsets[j]>mx) mx=offsets[j];
+  if(mx===0) mx=1;
+
+  var L=48,R=12,T=18,B=26;
+  var pW=W-L-R, pH=H-T-B;
+
+  ctx.strokeStyle='#334155'; ctx.lineWidth=0.5;
+  for(var i=0;i<=4;i++){
+    var y=T+pH*(1-i/4);
+    ctx.beginPath(); ctx.moveTo(L,y); ctx.lineTo(W-R,y); ctx.stroke();
+  }
+
+  ctx.fillStyle='#94a3b8'; ctx.font='9px sans-serif'; ctx.textAlign='center';
+  for(var i=0;i<wavelengths.length;i+=3){
+    var x=L+(i/(wavelengths.length-1))*pW;
+    ctx.fillText(wavelengths[i],x,H-4);
+  }
+  ctx.textAlign='right';
+  for(var i=0;i<=4;i++){
+    var y=T+pH*(1-i/4);
+    ctx.fillText((mx*i/4).toFixed(1),L-4,y+3);
+  }
+
+  var palette=['#38bdf8','#a78bfa','#4ade80','#fbbf24','#f87171',
+               '#60a5fa','#c4b5fd','#86efac','#fde68a','#fca5a5',
+               '#0ea5e9','#8b5cf6','#22c55e','#eab308','#ef4444',
+               '#7dd3fc','#ddd6fe','#bbf7d0','#fef3c7','#fecaca'];
+
+  for(var s=0;s<spectra.length;s++){
+    ctx.strokeStyle=palette[s%palette.length]; ctx.lineWidth=2; ctx.beginPath();
+    for(var i=0;i<spectra[s].length;i++){
+      var x=L+(i/(spectra[s].length-1))*pW;
+      var y=T+pH*(1-spectra[s][i]/mx);
+      if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+    if(spectra.length<=5){
+      ctx.fillStyle=palette[s%palette.length];
+      for(var i=0;i<spectra[s].length;i++){
+        var x=L+(i/(spectra[s].length-1))*pW;
+        var y=T+pH*(1-spectra[s][i]/mx);
+        ctx.beginPath(); ctx.arc(x,y,2,0,6.28); ctx.fill();
+      }
+    }
+  }
+
+  if(offsets && offsets.length){
+    ctx.strokeStyle='#94a3b8'; ctx.lineWidth=1.4;
+    ctx.setLineDash([5,4]); ctx.beginPath();
+    for(var i=0;i<offsets.length;i++){
+      var x=L+(i/(offsets.length-1))*pW;
+      var y=T+pH*(1-offsets[i]/mx);
+      if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke(); ctx.setLineDash([]);
+  }
+
+  ctx.font='10px sans-serif'; ctx.textAlign='left';
+  var legMax=Math.min(spectra.length,8);
+  for(var s=0;s<legMax;s++){
+    var lx=L+4+(s%4)*90;
+    var ly=T+1+Math.floor(s/4)*12;
+    ctx.fillStyle=palette[s%palette.length];
+    ctx.fillRect(lx,ly,10,3);
+    ctx.fillText(labels?labels[s]:('Meas '+(s+1)),lx+14,ly+6);
+  }
+  if(offsets && offsets.length){
+    var lx=L+4+(legMax%4)*90;
+    var ly=T+1+Math.floor(legMax/4)*12;
+    ctx.fillStyle='#94a3b8';
+    ctx.fillRect(lx,ly,10,3);
+    ctx.fillText('Cal offset',lx+14,ly+6);
+  }
+}
+
+function drawChart(data){
+  var sp=(data.spectra||[]).slice(-3);
+  var wl=data.wavelengths||WAVELENGTHS;
+  var base=(data.count||sp.length)-sp.length;
+  var labels=[]; for(var i=0;i<sp.length;i++) labels.push('Meas '+(base+i+1));
+  drawChartOn('chart', sp, wl, labels, null);
+}
+
+function wlClr(nm){
+  if(nm<450) return '#8b5cf6';
+  if(nm<500) return '#3b82f6';
+  if(nm<560) return '#22c55e';
+  if(nm<600) return '#eab308';
+  if(nm<650) return '#f97316';
+  if(nm<750) return '#ef4444';
+  return '#991b1b';
+}
+
+function drawLive(data){
+  var cv=document.getElementById('liveChart');
+  if(!cv) return;
+  var ctx=cv.getContext('2d');
+  var rect=cv.getBoundingClientRect();
+  var dpr=window.devicePixelRatio||1;
+  cv.width=rect.width*dpr; cv.height=rect.height*dpr;
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.scale(dpr,dpr);
+  var W=rect.width, H=rect.height;
+  ctx.clearRect(0,0,W,H);
+
+  var ch=data.ch, wl=data.wl||WAVELENGTHS;
+  if(!ch || !wl || ch.length!==18) return;
+
+  var mx=0;
+  for(var i=0;i<ch.length;i++) if(ch[i]>mx) mx=ch[i];
+  if(mx===0) mx=1;
+
+  var L=48,R=12,T=18,B=30;
+  var pW=W-L-R, pH=H-T-B;
+  var gap=pW/ch.length;
+  var bw=gap*0.7;
+
+  ctx.strokeStyle='#334155'; ctx.lineWidth=0.5;
+  for(var i=0;i<=4;i++){
+    var y=T+pH*(1-i/4);
+    ctx.beginPath(); ctx.moveTo(L,y); ctx.lineTo(W-R,y); ctx.stroke();
+  }
+
+  ctx.fillStyle='#94a3b8'; ctx.font='9px sans-serif'; ctx.textAlign='right';
+  for(var i=0;i<=4;i++){
+    var y=T+pH*(1-i/4);
+    ctx.fillText((mx*i/4).toFixed(1),L-4,y+3);
+  }
+
+  var names='ABCDEFGHIJKLRSTUVW';
+  ctx.textAlign='center';
+  for(var i=0;i<ch.length;i++){
+    var x=L+gap*i+gap/2-bw/2;
+    var h=ch[i]/mx*pH;
+    ctx.fillStyle=wlClr(wl[i]);
+    ctx.fillRect(x,T+pH-h,bw,h);
+    ctx.fillStyle='#94a3b8'; ctx.font='8px sans-serif';
+    ctx.fillText(wl[i],L+gap*i+gap/2,H-14);
+    ctx.fillText(names[i],L+gap*i+gap/2,H-4);
+  }
+}
+
+/* tabs */
+function showTab(id){
+  var tabs=document.querySelectorAll('.tab');
+  for(var i=0;i<tabs.length;i++) tabs[i].classList.toggle('active', tabs[i].dataset.tab===id);
+  var panes=document.querySelectorAll('.pane');
+  for(var i=0;i<panes.length;i++) panes[i].classList.remove('active');
+  document.getElementById('pane_'+id).classList.add('active');
+  if(id==='exp') maybeRefresh('exp', loadExperiments);
+  if(id==='spv') maybeRefresh('spv', populateExpSelect);
+  if(id==='exp2') maybeRefresh('exp2', populateExpSelect);
+}
+
+var cache = { exp:{data:null,ts:0}, spv:{data:null,ts:0,expId:null} };
+var TTL = 30000;
+
+function maybeRefresh(key, fn){
+  var c=cache[key];
+  if(!c || !c.data || (Date.now()-c.ts)>TTL) fn();
+}
+
+var pgOffset = 0, pgLimit = 50, pgTotal = 0;
+
+function loadExperiments(force){
+  var spin=document.getElementById('expSpin');
+  spin.classList.remove('hidden');
+  fetch('/history/experiments?limit='+pgLimit+'&offset='+pgOffset)
+    .then(function(r){return r.json();})
+    .then(function(j){
+      cache.exp={data:j,ts:Date.now()};
+      pgTotal=j.total||0;
+      renderExperiments(j.experiments||[]);
+      document.getElementById('pgInfo').textContent=
+        'Showing '+(pgOffset+1)+'-'+Math.min(pgOffset+pgLimit,pgTotal)+' of '+pgTotal;
+      document.getElementById('pgPrev').disabled = pgOffset<=0;
+      document.getElementById('pgNext').disabled = pgOffset+pgLimit>=pgTotal;
+      populateExpSelect(j.experiments);
+    })
+    .catch(function(e){ lg('history err: '+e.message); })
+    .then(function(){ spin.classList.add('hidden'); });
+}
+
+function pgMove(d){
+  pgOffset = Math.max(0, pgOffset + d*pgLimit);
+  loadExperiments(true);
+}
+
+function renderExperiments(rows){
+  var tb=document.querySelector('#expTbl tbody');
+  tb.innerHTML='';
+  if(!rows.length){
+    tb.innerHTML='<tr><td colspan="10" class="muted" style="text-align:center">No experiments yet.</td></tr>';
+    return;
+  }
+  for(var i=0;i<rows.length;i++){
+    var r=rows[i];
+    var tr=document.createElement('tr');
+    var dt=r.timestamp_ms?new Date(r.timestamp_ms).toLocaleString():'—';
+    tr.innerHTML =
+      '<td>'+esc(r.exp_id)+'</td>'+
+      '<td>'+esc(dt)+'</td>'+
+      '<td>'+r.num_measurements+'</td>'+
+      '<td>'+gainLabel(r.gain)+'</td>'+
+      '<td>'+r.int_cycles+'</td>'+
+      '<td>'+r.led_white_ma+'</td>'+
+      '<td>'+r.led_ir_ma+'</td>'+
+      '<td>'+r.led_uv_ma+'</td>'+
+      '<td><span class="pill '+(r.cal_valid?'ok':'er')+'">'+(r.cal_valid?'valid':'no')+'</span></td>'+
+      '<td><button class="bA" style="width:auto;padding:.2rem .5rem;font-size:.68rem;margin:0" '+
+      'onclick="viewSpectra(\''+esc(r.exp_id)+'\')">View Spectra</button></td>';
+    tb.appendChild(tr);
+  }
+}
+
+function gainLabel(g){ return ['1x','4x','16x','64x'][g]||g; }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){return'&#'+c.charCodeAt(0)+';';}); }
+
+function populateExpSelect(list){
+  var rows = list || (cache.exp.data && cache.exp.data.experiments) || [];
+  if(!list){
+    fetch('/history/experiments?limit=200&offset=0').then(function(r){return r.json();}).then(function(j){
+      populateExpSelect(j.experiments||[]);
+    });
+    return;
+  }
+  var opts='<option value="">-- select --</option>';
+  for(var i=0;i<rows.length;i++){
+    opts+='<option value="'+esc(rows[i].exp_id)+'">'+esc(rows[i].exp_id)+'</option>';
+  }
+  document.getElementById('spvSel').innerHTML=opts;
+  document.getElementById('exSel').innerHTML=opts;
+}
+
+function viewSpectra(expId){
+  showTab('spv');
+  document.getElementById('spvSel').value=expId;
+  loadSpectra();
+}
+
+function loadSpectra(){
+  var expId=document.getElementById('spvSel').value;
+  if(!expId) return;
+  var spin=document.getElementById('spvSpin');
+  spin.classList.remove('hidden');
+  fetch('/history/spectra?exp_id='+encodeURIComponent(expId))
+    .then(function(r){return r.json();})
+    .then(function(j){
+      cache.spv={data:j,ts:Date.now(),expId:expId};
+      renderSpectraViewer(j);
+    })
+    .catch(function(e){ lg('spectra err: '+e.message); })
+    .then(function(){ spin.classList.add('hidden'); });
+}
+
+var spvVisible = [];
+
+function renderSpectraViewer(j){
+  var sp=j.spectra||[];
+  spvVisible=[]; for(var i=0;i<sp.length;i++) spvVisible.push(true);
+
+  var cl=document.getElementById('spvChecks');
+  cl.innerHTML='';
+  for(var i=0;i<sp.length;i++){
+    (function(i){
+      var label=document.createElement('label');
+      label.innerHTML='<input type="checkbox" checked/> Meas '+(i+1);
+      label.querySelector('input').addEventListener('change', function(e){
+        spvVisible[i]=e.target.checked;
+        redrawSpv();
+      });
+      cl.appendChild(label);
+    })(i);
+  }
+
+  var head=document.getElementById('spvHead');
+  var wl=j.wavelengths||WAVELENGTHS;
+  var h='<th>#</th>';
+  for(var i=0;i<wl.length;i++) h+='<th>'+wl[i]+'</th>';
+  head.innerHTML=h;
+
+  var tb=document.querySelector('#spvTbl tbody');
+  tb.innerHTML='';
+  if(j.offsets && j.offsets.length){
+    var tr=document.createElement('tr');
+    var row='<td><em>Cal</em></td>';
+    for(var i=0;i<j.offsets.length;i++) row+='<td>'+j.offsets[i].toFixed(2)+'</td>';
+    tr.innerHTML=row;
+    tb.appendChild(tr);
+  }
+  for(var i=0;i<sp.length;i++){
+    var tr=document.createElement('tr');
+    var row='<td>'+(i+1)+'</td>';
+    for(var c=0;c<sp[i].length;c++) row+='<td>'+(+sp[i][c]).toFixed(2)+'</td>';
+    tr.innerHTML=row;
+    tb.appendChild(tr);
+  }
+
+  redrawSpv();
+}
+
+function redrawSpv(){
+  var j=cache.spv.data; if(!j) return;
+  var shown=[], labels=[];
+  for(var i=0;i<(j.spectra||[]).length;i++){
+    if(spvVisible[i]){ shown.push(j.spectra[i]); labels.push('Meas '+(i+1)); }
+  }
+  drawChartOn('spvChart', shown, j.wavelengths||WAVELENGTHS, labels, j.offsets||null);
+}
+
+function doExport(fmt){
+  var all=document.getElementById('exAll').checked;
+  var expId=document.getElementById('exSel').value;
+  var q = all ? 'all=true' : ('exp_id='+encodeURIComponent(expId||''));
+  if(!all && !expId){ alert('Select an experiment or check "Export all".'); return; }
+  window.location.href='/history/export/'+fmt+'?'+q;
+}
+
+document.getElementById('exSel').addEventListener('change', estSize);
+document.getElementById('exAll').addEventListener('change', estSize);
+
+function estSize(){
+  var all=document.getElementById('exAll').checked;
+  var sz=document.getElementById('exSz');
+  if(all){
+    var total=(cache.exp.data && cache.exp.data.total) || 0;
+    sz.textContent='~'+Math.round(total*2.5)+' KB estimated';
+  } else {
+    var expId=document.getElementById('exSel').value;
+    sz.textContent=expId?'~5–20 KB per experiment':'';
+  }
+}
+
+window.addEventListener('resize', function(){
+  if(lastStatus) updStatusCards(lastStatus);
+  if(cache.spv.data) redrawSpv();
+});
+
+setInterval(function(){
+  if(document.getElementById('pane_exp').classList.contains('active')) loadExperiments(false);
+}, 30000);
+
+lg('UI ready — connecting to MQTT broker...');
+connectMQTT();
+loadExperiments(true);
+</script>
+</body>
+</html>

@@ -246,7 +246,25 @@ function act(a){
   });
 }
 
+function showWarning(msg){
+  var w=document.getElementById('warnBar');
+  if(!w){
+    w=document.createElement('div');
+    w.id='warnBar';
+    w.style.cssText='background:#fbbf24;color:#0f172a;padding:.45rem;text-align:center;'+
+                    'border-radius:.4rem;margin:.4rem auto;max-width:900px;font-size:.78rem;'+
+                    'font-weight:700;cursor:pointer';
+    w.title='Click to dismiss';
+    w.onclick=function(){ w.remove(); };
+    document.body.insertBefore(w, document.querySelector('.pipe'));
+  }
+  w.textContent='⚠ '+msg+'  (click to dismiss)';
+  clearTimeout(w._t);
+  w._t=setTimeout(function(){ if(w.parentNode) w.remove(); }, 10000);
+}
+
 function applyCfg(){
+  var nVal=parseInt(document.getElementById('measN').value);
   var cfg={
     gain:parseInt(document.getElementById('gain').value),
     integrationCycles:parseInt(document.getElementById('intCycles').value),
@@ -257,11 +275,22 @@ function applyCfg(){
     ledWhiteEnabled:document.getElementById('ledW').checked,
     ledIrEnabled:document.getElementById('ledI').checked,
     ledUvEnabled:document.getElementById('ledU').checked,
-    N:parseInt(document.getElementById('measN').value),
+    N:nVal,
     expId:document.getElementById('expId').value.trim()||'EXP_001'
   };
   api('/api/config','POST',cfg).then(function(r){
-    if(r)lg('Config: '+(r.status||r.error));
+    if(r){
+      lg('Config: '+(r.status||r.error));
+      if(r.warning){
+        lg('⚠ '+r.warning);
+        showWarning(r.warning);
+        if(typeof r.N==='number'){
+          document.getElementById('measN').value=r.N;
+        }
+      }
+    }
+    // Clear stale spectra chart — experiment was reset server-side
+    clearChart();
   });
 }
 
@@ -313,6 +342,8 @@ function poll(){
 }
 
 /* ─── Canvas Chart ─────────────────────────────────────────────────────── */
+function fin(v){ return (typeof v==='number' && isFinite(v)) ? v : 0; }
+
 function drawChart(data){
   var cv=document.getElementById('chart');
   if(!cv)return;
@@ -320,17 +351,31 @@ function drawChart(data){
   var rect=cv.getBoundingClientRect();
   var dpr=window.devicePixelRatio||1;
   cv.width=rect.width*dpr;cv.height=rect.height*dpr;
+  ctx.setTransform(1,0,0,1,0,0);
   ctx.scale(dpr,dpr);
   var W=rect.width,H=rect.height;
   ctx.clearRect(0,0,W,H);
 
-  var sp=data.spectra.slice(-3);
-  var wl=data.wavelengths;
+  if(!data || !data.spectra) return;
+
+  // Defensive copy + sanitize non-finite values to 0 (prevents blank charts
+  // when sensor returns NaN/Inf on high-irradiance or post-config reads)
+  var sp=[];
+  var raw=data.spectra.slice(-3);
+  for(var i=0;i<raw.length;i++){
+    if(!raw[i] || !raw[i].length) continue;
+    var row=[];
+    for(var j=0;j<raw[i].length;j++) row.push(fin(raw[i][j]));
+    sp.push(row);
+  }
+  var wl=data.wavelengths||[];
   if(!sp.length||!wl.length)return;
 
   var mx=0;
-  for(var i=0;i<sp.length;i++)for(var j=0;j<sp[i].length;j++)if(sp[i][j]>mx)mx=sp[i][j];
-  if(mx===0)mx=1;
+  for(var i=0;i<sp.length;i++) for(var j=0;j<sp[i].length;j++){
+    if(sp[i][j]>mx) mx=sp[i][j];
+  }
+  if(!isFinite(mx) || mx<=0) mx=1;
 
   var L=48,R=12,T=18,B=26;
   var pW=W-L-R,pH=H-T-B;
@@ -355,27 +400,43 @@ function drawChart(data){
   var clr=['#38bdf8','#a78bfa','#34d399'];
   for(var s=0;s<sp.length;s++){
     ctx.strokeStyle=clr[s%3];ctx.lineWidth=2;ctx.beginPath();
+    var started=false;
     for(var i=0;i<sp[s].length;i++){
       var x=L+(i/(sp[s].length-1))*pW;
       var y=T+pH*(1-sp[s][i]/mx);
-      if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+      if(!isFinite(x)||!isFinite(y)) continue;
+      if(!started){ ctx.moveTo(x,y); started=true; } else ctx.lineTo(x,y);
     }
     ctx.stroke();
     ctx.fillStyle=clr[s%3];
     for(var i=0;i<sp[s].length;i++){
       var x=L+(i/(sp[s].length-1))*pW;
       var y=T+pH*(1-sp[s][i]/mx);
+      if(!isFinite(x)||!isFinite(y)) continue;
       ctx.beginPath();ctx.arc(x,y,2,0,6.28);ctx.fill();
     }
   }
 
   ctx.font='10px sans-serif';ctx.textAlign='left';
+  var total=fin(data.count)||sp.length;
   for(var s=0;s<sp.length;s++){
     var lx=L+4+s*80;
     ctx.fillStyle=clr[s%3];
     ctx.fillRect(lx,T+1,10,3);
-    ctx.fillText('Meas '+(data.count-sp.length+s+1),lx+14,T+7);
+    ctx.fillText('Meas '+(total-sp.length+s+1),lx+14,T+7);
   }
+}
+
+function clearChart(){
+  var cv=document.getElementById('chart');
+  if(!cv)return;
+  var ctx=cv.getContext('2d');
+  var rect=cv.getBoundingClientRect();
+  var dpr=window.devicePixelRatio||1;
+  cv.width=rect.width*dpr;cv.height=rect.height*dpr;
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.scale(dpr,dpr);
+  ctx.clearRect(0,0,rect.width,rect.height);
 }
 
 /* ─── Live Monitor ─────────────────────────────────────────────────────── */
@@ -463,7 +524,8 @@ function statusLoop(){
 
 function spectraLoop(){
   api('/api/spectra').then(function(d){
-    if(d&&d.count>0)drawChart(d);
+    if(d && d.count>0) drawChart(d);
+    else if(d) clearChart();
   });
   setTimeout(spectraLoop,3000);
 }

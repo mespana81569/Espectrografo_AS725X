@@ -89,11 +89,14 @@ IDLE → LIVE_MONITOR → IDLE
 | Calibration | `src/acquisition/calibration.cpp` | Collects 5-sample blank reference average; produces `CalibrationData` with offset[18]; `applyOffset()` subtracts from spectra |
 | Measurement Engine | `src/acquisition/measurement_engine.cpp` | Runs N sequential readings at 500 ms intervals; stores `float spectra[20][18]` in `Experiment` struct in RAM |
 | SD Logger | `src/storage/sd_logger.cpp` | VSPI (MOSI=23, MISO=19, SCK=18, CS=5); appends CSV rows to `/spectra.csv`; creates header on first write |
-| Web Server | `src/web/web_server.cpp` | WiFi AP mode (SSID: `Espectrografo-AP`, pass: `esp32spectro`, IP: `192.168.4.1`); serves HTML from PROGMEM; optional STA client mode |
-| API Routes | `src/web/api_routes.cpp` | REST endpoints (see table below) |
-| Frontend | `src/ui/html_content.h` | Full single-page HTML/CSS/JS app embedded as `PROGMEM` string; Chart.js overlay of last 3 spectra; polls `/api/status` every 1.5 s and `/api/spectra` every 3 s |
+| Web Server | `src/web/web_server.cpp` | WiFi AP mode (SSID: `Espectrografo-AP`, pass: `esp32spectro`, IP: `192.168.4.1`); serves embedded HTML from PROGMEM; optional STA client mode |
+| API Routes | `src/web/api_routes.cpp` | REST endpoints on ESP32; publishes state/spectra/status to MQTT topics |
+| Embedded Frontend | `src/ui/html_content.h` | Single-page HTML/CSS/JS in `PROGMEM` string; direct API polling (no MQTT); last 3 spectra chart; WiFi config overlay |
+| MQTT Bridge | `mqtt_to_db.py` | Subscribes to `esp32/data/*`, stores experiments/calibrations/measurements in MySQL database |
+| Remote Web Control | `control.html` | Standalone single-file HTML served from university server; Paho MQTT over WebSockets; real-time control and historical data viewing |
+| Flask Backend | `app.py` | Serves `control.html`, /history API routes (experiments, spectra, export); MySQL backend; CORS enabled |
 
-### REST API Endpoints
+### REST API Endpoints (ESP32)
 
 | Endpoint | Method | State Guard | Purpose |
 |---|---|---|---|
@@ -115,6 +118,16 @@ IDLE → LIVE_MONITOR → IDLE
 | `/api/wifi` | POST | — | Connect to external WiFi `{"ssid":"...","password":"..."}` |
 | `/api/wifi/scan` | POST | — | Trigger network scan |
 | `/api/wifi/scan` | GET | — | Scan status + cached results |
+
+**MQTT Publishing** (when in STA WiFi mode):
+- On state transitions: publish to `esp32/data/state`
+- On timer (~5s): publish status to `esp32/data/status` (heartbeat)
+- After measurement complete: publish spectra to `esp32/data/spectra`
+- After save to SD: publish to `esp32/data/upload`
+- During live monitor: publish live channels to `esp32/data/monitor`
+
+**MQTT Subscription** (when in STA WiFi mode):
+- Subscribe to `esp32/cmd/#` and handle commands published by remote clients
 
 ### Key Data Types
 
@@ -181,6 +194,17 @@ One row per individual measurement; multiple rows per experiment share the same 
 
 I2C clock: 400 kHz. SD SPI clock: 4 MHz (VSPI).
 
+## Sensor Wavelengths (AS7265X)
+
+18 channels, 410–940 nm:
+
+```
+Index  1   2    3    4    5    6    7    8    9    10   11   12   13   14   15   16   17   18
+   nm 410 435 460 485 510 535 560 585 610 645 680 705 730 760 810 860 900 940
+```
+
+Used in all spectra arrays, charts, and CSV/JSON exports.
+
 ## Dependencies
 
 Managed via `platformio.ini` (board: `esp32doit-devkit-v1`, framework: `arduino`, partition: `min_spiffs.csv`):
@@ -209,3 +233,328 @@ Build flags: `-DCORE_DEBUG_LEVEL=0 -DBOARD_HAS_PSRAM`.
 
 Total calibration time: ~4.6 s (5 × (420 ms blocking + 500 ms gap)).
 Total measurement time per experiment: N × ~920 ms.
+
+## Remote Control System
+
+### Architecture
+
+Two frontends connect to the ESP32:
+
+1. **Embedded UI** (`src/ui/html_content.h`) — served from ESP32 via HTTP on WiFi AP mode
+   - Direct REST polling of `/api/*` endpoints
+   - Stateful control: buttons, pipeline, config, live monitor
+   - Last 3 spectra chart
+
+2. **Remote Web Control** (`control.html`) — served from external Flask server
+   - Connects to MQTT broker (not directly to ESP32 HTTP)
+   - Real-time updates via MQTT messages
+   - Access to historical experiments from MySQL database
+   - Three tabs: live control panel + experiments table + spectra viewer + export
+
+### MQTT Message Flow
+
+**ESP32 → Broker** (ESP publishes after state changes or on schedule):
+- `esp32/data/state` → `{state, timestamp_ms, measCount, measTarget, ...}` (on transition)
+- `esp32/data/status` → `{state, sensorReady, sdReady, calValid, rssi, heap}` (heartbeat)
+- `esp32/data/spectra` → `{exp_id, spectra:[[18]×N], offsets:[18], wavelengths, count, timestamp_ms}` (after measurement)
+- `esp32/data/upload` → `{exp_id, timestamp_ms, ...}` (on save to SD)
+- `esp32/data/monitor` → `{ready, ch:[18], wl:[18]}` (live mode only)
+
+**Broker ← Remote Client** (control.html publishes commands):
+- `esp32/cmd/calibrate` → `""` (empty payload)
+- `esp32/cmd/confirm` → `""`
+- `esp32/cmd/measure` → `""`
+- `esp32/cmd/accept` → `""`
+- `esp32/cmd/save` → `""`
+- `esp32/cmd/discard` → `""`
+- `esp32/cmd/monitor/start` → `""`
+- `esp32/cmd/monitor/stop` → `""`
+- `esp32/cmd/config` → `{gain,integrationCycles,ledWhiteEnabled,ledWhiteCurrent,...}`
+
+**Bridge** (`mqtt_to_db.py`):
+- Listens on `esp32/data/*`
+- Inserts into MySQL tables: `experimentos`, `calibraciones`, `mediciones`
+- One-shot inserts with `INSERT IGNORE` (prevents duplicates on broker reconnect)
+
+### MQTT Broker Configuration
+
+- Host: `localhost` (Mosquitto)
+- Port: `1884` (WebSockets, non-SSL for local development)
+- Remote client connects via: `Paho.Client(MQTT_HOST, MQTT_PORT, MQTT_CLIENT_ID)`
+- Auto-reconnect with 5s backoff on disconnect
+
+### HTTP vs. MQTT
+
+| Operation | Embedded UI | Remote Control |
+|---|---|---|
+| Control commands | `POST /api/calibrate` | `MQTT esp32/cmd/calibrate` |
+| State updates | Poll `GET /api/status` | Subscribe `esp32/data/state` |
+| Live spectra | Poll `GET /api/spectra` | Subscribe `esp32/data/spectra` |
+| Live monitor | Poll `GET /api/monitor` | Subscribe `esp32/data/monitor` |
+| History | Not available | `GET /history/experiments`, `/history/spectra`, etc. |
+
+## MySQL Database Schema
+
+Managed by `mqtt_to_db.py`. Tables:
+
+```sql
+CREATE TABLE experimentos (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  exp_id VARCHAR(64) UNIQUE NOT NULL,
+  timestamp_ms BIGINT NOT NULL,
+  num_measurements INT,
+  gain INT,
+  mode INT,
+  int_cycles INT,
+  led_white_ma INT,
+  led_ir_ma INT,
+  led_uv_ma INT,
+  cal_valid BOOLEAN,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE calibraciones (
+  exp_id VARCHAR(64) PRIMARY KEY,
+  ch1 FLOAT, ch2 FLOAT, ..., ch18 FLOAT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE mediciones (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  exp_id VARCHAR(64),
+  meas_index INT,
+  ch1 FLOAT, ch2 FLOAT, ..., ch18 FLOAT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (exp_id) REFERENCES experimentos(exp_id)
+);
+```
+
+AS7265X 18 channels: 410, 435, 460, 485, 510, 535, 560, 585, 610, 645, 680, 705, 730, 760, 810, 860, 900, 940 nm.
+
+## Flask Backend (`app.py`)
+
+Serves `control.html` and historical data API:
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/` | GET | Serve `control.html` |
+| `/history/experiments` | GET | List experiments (limit, offset, pagination) |
+| `/history/spectra` | GET | Get all spectra for exp_id + offsets + wavelengths |
+| `/history/export/csv` | GET | Download spectra as CSV (one row per meas) |
+| `/history/export/json` | GET | Download experiment as JSON |
+
+Query parameters:
+- `/history/experiments?limit=50&offset=0`
+- `/history/spectra?exp_id=EXP_001`
+- `/history/export/csv?exp_id=EXP_001` or `?all=true`
+- `/history/export/json?exp_id=EXP_001` or `?all=true`
+
+CORS: `Access-Control-Allow-Origin: *`
+
+Database: `mysql-connector-python` with `SELECT ... FROM experimentos` / `mediciones` / `calibraciones` JOIN patterns. Parameterized SQL only — no string concatenation.
+
+## Deployment
+
+### Embedded UI (on ESP32)
+
+- Served from `http://192.168.4.1` in AP mode (built into firmware)
+- No external dependencies
+- Connect to WiFi SSID `Espectrografo-AP`, password `esp32spectro`
+- Polls local `/api/*` endpoints directly
+
+### Remote Control System (University Server)
+
+1. **MySQL Database** (one-time setup):
+   ```bash
+   mysql -u root
+   CREATE DATABASE espectrografo;
+   USE espectrografo;
+   
+   CREATE TABLE experimentos (
+     id INT AUTO_INCREMENT PRIMARY KEY,
+     exp_id VARCHAR(64) UNIQUE NOT NULL,
+     timestamp_ms BIGINT NOT NULL,
+     num_measurements INT,
+     gain INT, mode INT, int_cycles INT,
+     led_white_ma INT, led_ir_ma INT, led_uv_ma INT,
+     cal_valid BOOLEAN,
+     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+   );
+   
+   CREATE TABLE calibraciones (
+     exp_id VARCHAR(64) PRIMARY KEY,
+     ch1 FLOAT, ch2 FLOAT, ch3 FLOAT, ch4 FLOAT, ch5 FLOAT, ch6 FLOAT,
+     ch7 FLOAT, ch8 FLOAT, ch9 FLOAT, ch10 FLOAT, ch11 FLOAT, ch12 FLOAT,
+     ch13 FLOAT, ch14 FLOAT, ch15 FLOAT, ch16 FLOAT, ch17 FLOAT, ch18 FLOAT,
+     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+   );
+   
+   CREATE TABLE mediciones (
+     id INT AUTO_INCREMENT PRIMARY KEY,
+     exp_id VARCHAR(64),
+     meas_index INT,
+     ch1 FLOAT, ch2 FLOAT, ch3 FLOAT, ch4 FLOAT, ch5 FLOAT, ch6 FLOAT,
+     ch7 FLOAT, ch8 FLOAT, ch9 FLOAT, ch10 FLOAT, ch11 FLOAT, ch12 FLOAT,
+     ch13 FLOAT, ch14 FLOAT, ch15 FLOAT, ch16 FLOAT, ch17 FLOAT, ch18 FLOAT,
+     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+     FOREIGN KEY (exp_id) REFERENCES experimentos(exp_id)
+   );
+   ```
+
+2. **MQTT Broker** (Mosquitto):
+   ```bash
+   sudo apt-get install mosquitto mosquitto-clients
+   sudo systemctl start mosquitto
+   ```
+   Edit `/etc/mosquitto/mosquitto.conf` to enable WebSocket listener on port 1884:
+   ```
+   listener 1884
+   protocol websocket
+   ```
+
+3. **Flask App** (on university server):
+   ```bash
+   pip install -r requirements.txt
+   python app.py
+   ```
+   Serves `control.html` at `http://localhost:5000` and `/history/*` API routes.
+
+4. **MQTT Bridge** (in background):
+   ```bash
+   python mqtt_to_db.py &
+   ```
+   Subscribes to `esp32/data/*` and stores in MySQL.
+
+5. **ESP32 WiFi STA Mode** (to reach the MQTT broker):
+   - Use embedded UI "WiFi / Send to DB" button to connect to lab network
+   - Once STA is connected, firmware publishes to `esp32/data/*` topics
+   - MQTT broker must be accessible from ESP's network
+
+### Troubleshooting
+
+- **control.html won't connect**: Verify MQTT broker is running (`mosquitto` on localhost:1884 with WebSocket)
+- **No history data**: Check `mqtt_to_db.py` is running and MySQL connection works
+- **CSV/JSON export fails**: Verify `control.html` is in the same directory as `app.py`
+- **ESP32 not publishing**: Ensure it's in STA mode (connected to lab WiFi), not AP mode
+
+## Verify-Before-Delete (SD ↔ DB consistency)
+
+The SD card keeps raw CSV as the source of truth until MySQL is confirmed to hold the same data. Sequence:
+
+1. `SDLogger::saveExperiment()` appends rows to `/spectra.csv` AND writes `/pending/<exp_id>.json` = `{exp_id, expected_rows, saved_at_ms}`
+2. In parallel, the ESP32 publishes `esp32/data/upload` via MQTT; `mqtt_to_db.py` inserts rows into `mediciones`
+3. Periodically (recommended: every 30 s while STA WiFi is up), the ESP32 calls `g_sdLogger.cleanupVerifiedExperiments(MQTT_BROKER_HOST, 5000)`
+4. For each pending flag, ESP32 issues `GET /verify?exp_id=...&expected=N` against the Flask server
+5. Flask queries `SELECT COUNT(*) FROM mediciones WHERE exp_id=?` and returns `{verified, rows_found, rows_expected, experiment_registered}`
+6. On `verified:true`, ESP32 calls `removeExperimentRows()` (atomic CSV rewrite via `/spectra.tmp`) and then `clearPending()`
+
+**Crash safety invariants:**
+- A flag file is created BEFORE deletion can be considered. If the ESP reboots between save and verify, the flag survives → cleanup resumes on next boot
+- The CSV rewrite uses a tmp file + rename. If power is lost mid-rewrite, either the original or the new file is intact — never both corrupt
+- A `verified:false` or unreachable server is treated identically: flag stays, retry next pass. **Rows are never deleted without an explicit `verified:true` from the server**
+
+**Retry policy** (`sd_logger.cpp`):
+- `VERIFY_MAX_RETRIES = 3` (per cleanup pass per experiment)
+- `VERIFY_TIMEOUT_MS = 5000` (per HTTP GET)
+- Inter-attempt sleep: 500 ms
+
+**Integration point** (`main.cpp`, not yet wired):
+```cpp
+static unsigned long _lastCleanup = 0;
+void loop() {
+    // ... existing state machine tick ...
+    if (millis() - _lastCleanup > 30000 && WiFi.status() == WL_CONNECTED) {
+        _lastCleanup = millis();
+        g_sdLogger.cleanupVerifiedExperiments(MQTT_BROKER_HOST, 5000);
+    }
+}
+```
+
+## Known Bug Fixes
+
+### Chart blank-render (fixed)
+
+**Symptom:** "Spectra (last 3 measurements)" intermittently blank; worsens near measCount=20; never renders again after POST `/api/config` until reboot.
+
+**Root cause:** On high-irradiance reads or after `applyConfig()` put the sensor in a transient bad state, `takeMeasurement()` could return `NaN`/`Inf` floats. `api_routes.cpp` serialized these as `"nan"` — invalid JSON — so `fetch().json()` rejected and `drawChart()` was never called. Cascading miss: once any bad value landed in `spectra[20][18]`, every subsequent `/api/spectra` poll would include it, poisoning every future render.
+
+**Fix:** `api_routes.cpp::handleGetSpectra` (and `/api/calibration`, `/api/monitor`) now pass floats through `isfinite()` and substitute `0.0` on non-finite. `html_content.h::drawChart` additionally sanitizes on the client, uses `ctx.setTransform(1,0,0,1,0,0)` before re-scaling to avoid compounded DPR scaling, skips non-finite points in path drawing, and has a `clearChart()` helper called on `count==0` or after `applyCfg()` so the stale last frame does not linger after a config change.
+
+### N>20 clamp warning (fixed)
+
+**Symptom:** Requesting `N=25` silently clamped to 20 with no user feedback.
+
+**Fix:** `handleSetConfig` now returns `{status:"config_applied", N:<effective>, warning:"..."}` when clamping occurs. The embedded UI shows a yellow dismissible banner via `showWarning()` and auto-corrects the `measN` input. Warning is also logged to the activity log.
+
+## ESP32 MQTT Implementation (TODO for firmware)
+
+The remote control system requires MQTT publishing support in the firmware. Skeleton:
+
+1. **Add dependency**: PubSubClient or Arduino-MQTT in `platformio.ini`
+
+2. **MQTT client singleton** in `src/core/mqtt_client.h`:
+   - Global `g_mqttClient` instance
+   - Connect on STA WiFi ready
+   - Disconnect on STA loss
+
+3. **State transition hook** (in `state_machine.cpp` `exitState()`):
+   ```cpp
+   publishToMqtt("esp32/data/state", {
+     "state": newState,
+     "timestamp_ms": millis(),
+     "measCount": g_measurementEngine.getCount(),
+     "measTarget": g_config.N,
+     ...
+   });
+   ```
+
+4. **Heartbeat timer** (~5s in main loop):
+   ```cpp
+   publishToMqtt("esp32/data/status", {
+     "state": g_stateMachine.getState(),
+     "sensorReady": g_sensorDriver.isReady(),
+     "sdReady": g_sdLogger.isReady(),
+     "calValid": g_calibration.isValid(),
+     "rssi": WiFi.RSSI(),
+     "heap": ESP.getFreeHeap()
+   });
+   ```
+
+5. **Spectra publish** (after `g_measurementEngine` completes):
+   ```cpp
+   publishToMqtt("esp32/data/spectra", {
+     "exp_id": g_config.expId,
+     "spectra": [18×N floats],
+     "offsets": g_calibration.offset[18],
+     "wavelengths": [410, 435, ..., 940],
+     "count": N,
+     "timestamp_ms": g_experiment.timestamp
+   });
+   ```
+
+6. **Upload publish** (after `g_sdLogger.saveExperiment()`):
+   ```cpp
+   publishToMqtt("esp32/data/upload", {
+     "exp_id": g_config.expId,
+     "timestamp_ms": millis()
+   });
+   ```
+
+7. **Live monitor publish** (in live monitor loop):
+   ```cpp
+   if (g_liveReady) {
+     publishToMqtt("esp32/data/monitor", {
+       "ready": true,
+       "ch": g_liveBuf[18],
+       "wl": [410, 435, ..., 940]
+     });
+   }
+   ```
+
+8. **Command subscription** (on MQTT connect):
+   ```cpp
+   client.subscribe("esp32/cmd/#");
+   // onMessage: extract topic, check state guard, call requestTransition()
+   ```
+
+Until MQTT is implemented, the embedded UI and remote control via HTTP will still work independently.

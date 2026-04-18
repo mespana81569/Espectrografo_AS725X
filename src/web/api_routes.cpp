@@ -80,14 +80,30 @@ static void handleSetConfig(AsyncWebServerRequest* req, uint8_t* data, size_t le
 
     g_sensorDriver.applyConfig(cfg);
 
-    int n = doc.containsKey("N") ? (int)doc["N"] : 5;
+    int nReq = doc.containsKey("N") ? (int)doc["N"] : 5;
+    int n = nReq;
+    String warning = "";
+    if (n > MAX_MEASUREMENTS) {
+        warning = "N=" + String(nReq) + " exceeds MAX_MEASUREMENTS (" +
+                  String(MAX_MEASUREMENTS) + "); clamped to " + String(MAX_MEASUREMENTS);
+        n = MAX_MEASUREMENTS;
+    } else if (n < 1) {
+        warning = "N=" + String(nReq) + " below minimum (1); clamped to 1";
+        n = 1;
+    }
     g_measurementEngine.configure(n, cfg);
 
     if (doc.containsKey("expId")) {
         g_measurementEngine.resetExperiment(doc["expId"]);
     }
 
-    sendOk(req, "config_applied");
+    StaticJsonDocument<256> resp;
+    resp["status"] = "config_applied";
+    resp["N"] = n;
+    if (warning.length() > 0) resp["warning"] = warning;
+    String out;
+    serializeJson(resp, out);
+    sendJson(req, out);
 }
 
 // ─── POST /api/calibrate ─────────────────────────────────────────────────────
@@ -122,27 +138,35 @@ static void handleStartMeasure(AsyncWebServerRequest* req) {
 }
 
 // ─── GET /api/spectra ────────────────────────────────────────────────────────
-// Returns all acquired spectra for current experiment
+// Returns all acquired spectra for current experiment.
+// Non-finite values (NaN/Inf) are replaced with 0.0 to keep the response valid
+// JSON — Arduino's String(NaN,4) yields "nan" which is not JSON and would crash
+// the client parser, silently blanking the chart.
 static void handleGetSpectra(AsyncWebServerRequest* req) {
     const Experiment& exp = g_measurementEngine.getExperiment();
 
-    // Build JSON: { expId, count, wavelengths:[...], spectra:[[...], ...] }
-    // Using chunked response for large data
+    // Clamp count to MAX_MEASUREMENTS defensively in case of corruption
+    int safeCount = exp.count;
+    if (safeCount < 0) safeCount = 0;
+    if (safeCount > MAX_MEASUREMENTS) safeCount = MAX_MEASUREMENTS;
+
     String json = "{";
     json += "\"expId\":\"";  json += exp.experiment_id; json += "\",";
-    json += "\"count\":";    json += exp.count;         json += ",";
+    json += "\"count\":";    json += safeCount;         json += ",";
     json += "\"wavelengths\":[";
     for (int i = 0; i < NUM_CHANNELS; i++) {
         if (i) json += ",";
         json += AS7265xDriver::WAVELENGTHS[i];
     }
     json += "],\"spectra\":[";
-    for (int m = 0; m < exp.count; m++) {
+    for (int m = 0; m < safeCount; m++) {
         if (m) json += ",";
         json += "[";
         for (int c = 0; c < NUM_CHANNELS; c++) {
             if (c) json += ",";
-            json += String(exp.spectra[m][c], 4);
+            float v = exp.spectra[m][c];
+            if (!isfinite(v)) v = 0.0f;
+            json += String(v, 4);
         }
         json += "]";
     }
@@ -158,7 +182,9 @@ static void handleGetCalibration(AsyncWebServerRequest* req) {
     json += ",\"offset\":[";
     for (int i = 0; i < NUM_CHANNELS; i++) {
         if (i) json += ",";
-        json += String(cal.offset[i], 4);
+        float v = cal.offset[i];
+        if (!isfinite(v)) v = 0.0f;
+        json += String(v, 4);
     }
     json += "]}";
     sendJson(req, json);
@@ -232,7 +258,9 @@ static void handleMonitorData(AsyncWebServerRequest* req) {
     String json = "{\"ready\":true,\"ch\":[";
     for (int i = 0; i < NUM_CHANNELS; i++) {
         if (i) json += ",";
-        json += String(g_liveBuf[i], 4);
+        float v = g_liveBuf[i];
+        if (!isfinite(v)) v = 0.0f;
+        json += String(v, 4);
     }
     json += "],\"wl\":[";
     for (int i = 0; i < NUM_CHANNELS; i++) {

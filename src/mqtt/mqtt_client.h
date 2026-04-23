@@ -15,7 +15,7 @@
 
 // ─── Broker configuration ───────────────────────────────────────────────────
 // PubSubClient expects a plain hostname (no scheme, no brackets).
-#define MQTT_BROKER_HOST   "10.124.102.52"
+#define MQTT_BROKER_HOST   "10.124.102.28"
 //#define MQTT_BROKER_HOST   "cygnus.uniajc.edu.co"
 #define MQTT_BROKER_PORT   1884
 #define MQTT_CLIENT_ID     "espectrografo-01"

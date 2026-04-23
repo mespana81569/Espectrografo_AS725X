@@ -1,0 +1,61 @@
+﻿services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: espectrografo_mqtt
+    ports:
+      - "1884:1884"
+    volumes:
+      - ./docker/mosquitto.conf:/mosquitto/config/mosquitto.conf
+    restart: always
+
+  mysql:
+    image: mysql:8.4
+    container_name: espectrografo_db
+    env_file: ./docker/.env
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql-init:/docker-entrypoint-initdb.d
+    restart: always
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  flask:
+    build:
+      context: ./server
+      dockerfile: ../docker/Dockerfile.flask
+    container_name: espectrografo_flask
+    ports:
+      - "5000:5000"
+    env_file: ./docker/.env
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_USER: root
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: always
+
+  mqtt_bridge:
+    build:
+      context: ./server
+      dockerfile: ../docker/Dockerfile.mqtt_bridge
+    container_name: espectrografo_bridge
+    env_file: ./docker/.env
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_USER: root
+      MQTT_BROKER: mosquitto
+    depends_on:
+      mysql:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+    restart: always
+
+volumes:
+  mysql_data:

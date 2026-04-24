@@ -145,6 +145,9 @@
     <button class="bG" id="b5" onclick="act('save')" disabled>5. Save to SD</button>
     <button class="bR" id="b6" onclick="act('discard')" disabled>Discard</button>
 
+    <h2 style="margin-top:.5rem">Data Transfer</h2>
+    <button class="bP" id="bPull" onclick="pullData()" disabled>Pull Data from ESP32 &rarr; DB</button>
+
     <h2 style="margin-top:.5rem">Diagnostics</h2>
     <button class="bA" id="bMon" onclick="monStart()">Live Monitor</button>
     <button class="bR" id="bMonStop" onclick="monStop()" disabled>Stop Monitor</button>
@@ -219,8 +222,14 @@
         <button class="bA" onclick="loadSpectra()">Load</button>
         <span id="spvSpin" class="spin hidden"></span>
       </div>
+      <h2 style="margin:.4rem 0">Measurements &amp; Calibration</h2>
       <canvas id="spvChart" class="cvBig" height="320"></canvas>
       <div class="measCheckList" id="spvChecks"></div>
+      <p class="muted" style="margin:.3rem 0">Showing up to the last 3 measurements selected below. Dashed gray line = calibration offsets (blank reference).</p>
+
+      <h2 style="margin:.8rem 0 .4rem">Calibration vs Mean of Measurements</h2>
+      <canvas id="spvMeanChart" class="cvBig" height="280"></canvas>
+      <p class="muted" style="margin:.3rem 0">Per-channel mean of all measurements in this experiment, overlaid on the calibration offsets.</p>
       <div class="scroll" style="margin-top:.5rem">
         <table class="tblRaw" id="spvTbl">
           <thead><tr id="spvHead"></tr></thead>
@@ -263,6 +272,9 @@ var uploadCount = 0;
 var mqttConnected = false;
 var client = null;
 var reconnectTimer = null;
+var espSeen = false;
+var espLastSeenMs = 0;
+var ESP_TIMEOUT_MS = 15000;
 
 function lg(m){
   var el=document.getElementById('log');
@@ -362,6 +374,9 @@ function onMqttMessage(m){
       if(data.state){ cur=data.state; updPipe(cur); updBtns(cur); updStateBadge(cur); }
       document.getElementById('espDot').className='d ok';
       document.getElementById('espTxt').textContent=new Date().toLocaleTimeString();
+      espSeen = true;
+      espLastSeenMs = Date.now();
+      updBtns(cur);
       if(data.rssi!=null) document.getElementById('rssiTxt').textContent=data.rssi+' dBm';
       if(data.heap!=null) document.getElementById('heapTxt').textContent=Math.round(data.heap/1024)+' KB';
       updStatusCards(lastStatus);
@@ -433,6 +448,8 @@ function updBtns(s){
   document.getElementById('b6').disabled      = !on || s!=='SAVE_DECISION';
   document.getElementById('bMon').disabled    = !on || !idle;
   document.getElementById('bMonStop').disabled= !on || !live;
+  var pullBtn=document.getElementById('bPull');
+  if(pullBtn) pullBtn.disabled = !on || !espSeen || !idle;
   document.getElementById('chartCard').classList.toggle('hidden',live);
   document.getElementById('liveCard').classList.toggle('hidden',!live);
 }
@@ -478,12 +495,23 @@ function applyCfg(){
 function monStart(){ pubCmd('esp32/cmd/monitor/start',''); lg('> monitor start'); }
 function monStop(){ pubCmd('esp32/cmd/monitor/stop',''); lg('> monitor stop'); }
 
+function pullData(){
+  if(!espSeen){ lg('Pull Data: ESP32 not detected'); return; }
+  pubCmd('esp32/cmd/pull_data','');
+  lg('> pull_data requested');
+}
+
 /* chart drawing â€” mirrors html_content.h */
-function drawChartOn(cvId, spectra, wavelengths, labels, offsets){
+function drawChartOn(cvId, spectra, wavelengths, labels, offsets, opts){
   var cv=document.getElementById(cvId);
   if(!cv) return;
-  var ctx=cv.getContext('2d');
   var rect=cv.getBoundingClientRect();
+  if(rect.width < 10){
+    // Canvas not laid out yet (hidden tab, etc.) — retry on next frame.
+    requestAnimationFrame(function(){ drawChartOn(cvId, spectra, wavelengths, labels, offsets, opts); });
+    return;
+  }
+  var ctx=cv.getContext('2d');
   var dpr=window.devicePixelRatio||1;
   cv.width=rect.width*dpr; cv.height=rect.height*dpr;
   ctx.setTransform(1,0,0,1,0,0);
@@ -493,12 +521,16 @@ function drawChartOn(cvId, spectra, wavelengths, labels, offsets){
 
   if(!spectra || !spectra.length || !wavelengths || !wavelengths.length) return;
 
+  var xLabel = (opts && opts.xLabel) || 'Wavelength (nm)';
+  var yLabel = (opts && opts.yLabel) || 'Transmittance';
+  var offsetsLabel = (opts && opts.offsetsLabel) || 'Cal offset';
+
   var mx=0;
   for(var i=0;i<spectra.length;i++) for(var j=0;j<spectra[i].length;j++) if(spectra[i][j]>mx) mx=spectra[i][j];
   if(offsets) for(var j=0;j<offsets.length;j++) if(offsets[j]>mx) mx=offsets[j];
   if(mx===0) mx=1;
 
-  var L=48,R=12,T=18,B=26;
+  var L=56,R=12,T=18,B=42;
   var pW=W-L-R, pH=H-T-B;
 
   ctx.strokeStyle='#334155'; ctx.lineWidth=0.5;
@@ -510,13 +542,23 @@ function drawChartOn(cvId, spectra, wavelengths, labels, offsets){
   ctx.fillStyle='#94a3b8'; ctx.font='9px sans-serif'; ctx.textAlign='center';
   for(var i=0;i<wavelengths.length;i+=3){
     var x=L+(i/(wavelengths.length-1))*pW;
-    ctx.fillText(wavelengths[i],x,H-4);
+    ctx.fillText(wavelengths[i],x,H-20);
   }
   ctx.textAlign='right';
   for(var i=0;i<=4;i++){
     var y=T+pH*(1-i/4);
     ctx.fillText((mx*i/4).toFixed(1),L-4,y+3);
   }
+  // Axis titles
+  ctx.fillStyle='#e2e8f0'; ctx.font='11px sans-serif';
+  ctx.textAlign='center';
+  ctx.fillText(xLabel, L+pW/2, H-4);
+  ctx.save();
+  ctx.translate(12, T+pH/2);
+  ctx.rotate(-Math.PI/2);
+  ctx.textAlign='center';
+  ctx.fillText(yLabel, 0, 0);
+  ctx.restore();
 
   var palette=['#38bdf8','#a78bfa','#4ade80','#fbbf24','#f87171',
                '#60a5fa','#c4b5fd','#86efac','#fde68a','#fca5a5',
@@ -566,7 +608,7 @@ function drawChartOn(cvId, spectra, wavelengths, labels, offsets){
     var ly=T+1+Math.floor(legMax/4)*12;
     ctx.fillStyle='#94a3b8';
     ctx.fillRect(lx,ly,10,3);
-    ctx.fillText('Cal offset',lx+14,ly+6);
+    ctx.fillText(offsetsLabel,lx+14,ly+6);
   }
 }
 
@@ -575,7 +617,8 @@ function drawChart(data){
   var wl=data.wavelengths||WAVELENGTHS;
   var base=(data.count||sp.length)-sp.length;
   var labels=[]; for(var i=0;i<sp.length;i++) labels.push('Meas '+(base+i+1));
-  drawChartOn('chart', sp, wl, labels, null);
+  drawChartOn('chart', sp, wl, labels, null,
+              {xLabel:'Wavelength (nm)', yLabel:'Transmittance'});
 }
 
 function wlClr(nm){
@@ -645,7 +688,10 @@ function showTab(id){
   for(var i=0;i<panes.length;i++) panes[i].classList.remove('active');
   document.getElementById('pane_'+id).classList.add('active');
   if(id==='exp') maybeRefresh('exp', loadExperiments);
-  if(id==='spv') maybeRefresh('spv', populateExpSelect);
+  if(id==='spv'){
+    maybeRefresh('spv', populateExpSelect);
+    if(cache.spv.data) requestAnimationFrame(redrawSpv);
+  }
   if(id==='exp2') maybeRefresh('exp2', populateExpSelect);
 }
 
@@ -754,14 +800,17 @@ var spvVisible = [];
 
 function renderSpectraViewer(j){
   var sp=j.spectra||[];
-  spvVisible=[]; for(var i=0;i<sp.length;i++) spvVisible.push(true);
+  // Default: only the last 3 measurements are visible.
+  spvVisible=[];
+  for(var i=0;i<sp.length;i++) spvVisible.push(i >= sp.length-3);
 
   var cl=document.getElementById('spvChecks');
   cl.innerHTML='';
   for(var i=0;i<sp.length;i++){
     (function(i){
       var label=document.createElement('label');
-      label.innerHTML='<input type="checkbox" checked/> Meas '+(i+1);
+      var chk=spvVisible[i]?' checked':'';
+      label.innerHTML='<input type="checkbox"'+chk+'/> Meas '+(i+1);
       label.querySelector('input').addEventListener('change', function(e){
         spvVisible[i]=e.target.checked;
         redrawSpv();
@@ -798,11 +847,38 @@ function renderSpectraViewer(j){
 
 function redrawSpv(){
   var j=cache.spv.data; if(!j) return;
+  var wl=j.wavelengths||WAVELENGTHS;
+  var all=j.spectra||[];
+
+  // Plot 1: selected measurements (default last 3) + calibration offsets overlay.
   var shown=[], labels=[];
-  for(var i=0;i<(j.spectra||[]).length;i++){
-    if(spvVisible[i]){ shown.push(j.spectra[i]); labels.push('Meas '+(i+1)); }
+  for(var i=0;i<all.length;i++){
+    if(spvVisible[i]){ shown.push(all[i]); labels.push('Meas '+(i+1)); }
   }
-  drawChartOn('spvChart', shown, j.wavelengths||WAVELENGTHS, labels, j.offsets||null);
+  if(shown.length > 3){
+    // Keep at most the last 3 in the plot even if more are checked.
+    shown = shown.slice(-3);
+    labels = labels.slice(-3);
+  }
+  drawChartOn('spvChart', shown, wl, labels, j.offsets||null,
+              {xLabel:'Wavelength (nm)', yLabel:'Transmittance',
+               offsetsLabel:'Cal offset (blank ref.)'});
+
+  // Plot 2: calibration offsets vs per-channel mean across ALL measurements.
+  if(all.length && wl.length){
+    var mean=new Array(wl.length); for(var k=0;k<wl.length;k++) mean[k]=0;
+    for(var i=0;i<all.length;i++){
+      for(var k=0;k<wl.length;k++) mean[k] += (+all[i][k])||0;
+    }
+    for(var k=0;k<wl.length;k++) mean[k] /= all.length;
+    drawChartOn('spvMeanChart', [mean], wl, ['Mean of '+all.length+' meas'],
+                j.offsets||null,
+                {xLabel:'Wavelength (nm)', yLabel:'Transmittance',
+                 offsetsLabel:'Cal offset (blank ref.)'});
+  } else {
+    drawChartOn('spvMeanChart', [], wl, [], null,
+                {xLabel:'Wavelength (nm)', yLabel:'Transmittance'});
+  }
 }
 
 function doExport(fmt){
@@ -836,6 +912,15 @@ window.addEventListener('resize', function(){
 setInterval(function(){
   if(document.getElementById('pane_exp').classList.contains('active')) loadExperiments(false);
 }, 30000);
+
+setInterval(function(){
+  if(espSeen && (Date.now()-espLastSeenMs) > ESP_TIMEOUT_MS){
+    espSeen = false;
+    document.getElementById('espDot').className='d er';
+    document.getElementById('espTxt').textContent='timeout';
+    updBtns(cur);
+  }
+}, 2000);
 
 lg('UI ready â€” connecting to MQTT broker...');
 connectMQTT();

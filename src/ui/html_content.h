@@ -104,7 +104,7 @@ static const char HTML_CONTENT[] PROGMEM = R"rawhtml(
     <h2 style="margin-top:.5rem">Diagnostics</h2>
     <button class="bA" id="bMon" onclick="monStart()">Live Monitor</button>
     <button class="bR" id="bMonStop" onclick="monStop()" disabled>Stop Monitor</button>
-    <button class="bA" id="bWifi" onclick="openWifi()">WiFi / Send to DB</button>
+    <button class="bA" id="bWifi" onclick="openWifi()">WiFi</button>
     <div id="log"></div>
   </div>
 

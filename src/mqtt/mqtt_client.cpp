@@ -91,6 +91,7 @@ MqttClient::MqttClient()
       _pendingDiscard(false),
       _pendingConfig(false),
       _pendingConfigLen(0),
+      _pendingPullData(false),
       _uploadState(UploadState::IDLE),
       _uploadSucceeded(false) {
     memset(_pendingConfigBuf, 0, sizeof(_pendingConfigBuf));
@@ -177,13 +178,12 @@ void MqttClient::tick() {
     // 3) Pump the protocol (no delay() inside — well-behaved).
     _client.loop();
 
-    // 4) Edge: first successful connect → subscribe + kick off SD upload.
+    // 4) Edge: first successful connect → subscribe only. Bulk upload is
+    //    now user-triggered via esp32/cmd/pull_data.
     if (!_wasConnected) {
         _wasConnected = true;
         Serial.println("[MQTT] Connected to broker");
         subscribeAll();
-        triggerSDUpload();
-        // Publish current state so control.html sees a fresh snapshot.
         publishState(g_stateMachine.getStateName());
     }
 
@@ -220,6 +220,7 @@ void MqttClient::subscribeAll() {
     _client.subscribe(MQTT_TOPIC_CMD_SAVE);
     _client.subscribe(MQTT_TOPIC_CMD_DISCARD);
     _client.subscribe(MQTT_TOPIC_CMD_CONFIG);
+    _client.subscribe(MQTT_TOPIC_CMD_PULL_DATA);
     Serial.println("[MQTT] Subscribed to esp32/cmd/*");
 }
 
@@ -265,6 +266,8 @@ void MqttClient::handleCallback(const char* topic, const uint8_t* payload, unsig
         _pendingConfigBuf[n] = 0;
         _pendingConfigLen = n;
         _pendingConfig = true;
+    } else if (!strcmp(topic, MQTT_TOPIC_CMD_PULL_DATA)) {
+        _pendingPullData = true;
     }
 }
 
@@ -300,9 +303,9 @@ void MqttClient::processPendingCommands() {
     if (_pendingSave) {
         _pendingSave = false;
         if (g_stateMachine.getState() == SystemState::SAVE_DECISION) {
-            // Mirror the REST /api/save flow so the behaviour is identical.
-            bool ok = g_sdLogger.saveExperiment(g_measurementEngine.getExperiment());
-            if (ok) publishExperiment(g_measurementEngine.getExperiment());
+            // Mirror the REST /api/save flow: persist locally only. Upload to
+            // the DB is deferred until the user presses Pull Data.
+            (void)g_sdLogger.saveExperiment(g_measurementEngine.getExperiment());
             g_stateMachine.requestTransition(SystemState::IDLE);
         }
     }
@@ -311,6 +314,16 @@ void MqttClient::processPendingCommands() {
         _pendingDiscard = false;
         if (g_stateMachine.getState() == SystemState::SAVE_DECISION) {
             g_stateMachine.requestTransition(SystemState::IDLE);
+        }
+    }
+
+    if (_pendingPullData) {
+        _pendingPullData = false;
+        if (_uploadState == UploadState::IDLE) {
+            Serial.println("[MQTT] pull_data — triggering SD upload");
+            triggerSDUpload();
+        } else {
+            Serial.println("[MQTT] pull_data ignored — upload already in progress");
         }
     }
 

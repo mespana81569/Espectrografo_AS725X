@@ -28,6 +28,7 @@
 #define MQTT_TOPIC_CMD_SAVE      "esp32/cmd/save"
 #define MQTT_TOPIC_CMD_DISCARD   "esp32/cmd/discard"
 #define MQTT_TOPIC_CMD_CONFIG    "esp32/cmd/config"
+#define MQTT_TOPIC_CMD_PULL_DATA "esp32/cmd/pull_data"
 
 // Data (published) — ESP32 → control.html
 #define MQTT_TOPIC_DATA_STATE    "esp32/data/state"
@@ -108,6 +109,8 @@ private:
     volatile bool _pendingConfig;
     size_t        _pendingConfigLen;
     char          _pendingConfigBuf[768];
+
+    volatile bool _pendingPullData;
 
     // ─── SD bulk upload state ─────────────────────────────────────────────
     enum class UploadState : uint8_t {

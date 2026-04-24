@@ -197,9 +197,6 @@ static void handleSave(AsyncWebServerRequest* req) {
         return;
     }
     bool ok = g_sdLogger.saveExperiment(g_measurementEngine.getExperiment());
-    if (ok && g_mqttClient.isConnected()) {
-        g_mqttClient.publishExperiment(g_measurementEngine.getExperiment());
-    }
     g_stateMachine.requestTransition(SystemState::IDLE);
     if (ok) sendOk(req, "saved");
     else    sendError(req, "SD write failed", 500);

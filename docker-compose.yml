@@ -3,7 +3,8 @@
     image: eclipse-mosquitto:2.0
     container_name: espectrografo_mqtt
     ports:
-      - "1884:1884"
+      - "1883:1883"
+      - "9001:9001"
     volumes:
       - ./docker/mosquitto.conf:/mosquitto/config/mosquitto.conf
     restart: always
@@ -50,6 +51,7 @@
       MYSQL_HOST: mysql
       MYSQL_USER: root
       MQTT_BROKER: mosquitto
+      MQTT_PORT: 1883
     depends_on:
       mysql:
         condition: service_healthy

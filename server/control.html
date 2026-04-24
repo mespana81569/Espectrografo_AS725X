@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
@@ -251,7 +251,7 @@
 
 <script>
 var MQTT_HOST = "localhost";
-var MQTT_PORT = 1884;
+var MQTT_PORT = 9001;
 var MQTT_CLIENT_ID = "control_" + Math.random().toString(16).substr(2,8);
 
 var WAVELENGTHS = [410,435,460,485,510,535,560,585,610,645,680,705,730,760,810,860,900,940];
@@ -333,7 +333,7 @@ function onMQTTFail(e){
 }
 
 function pubCmd(topic, payload){
-  if(!mqttConnected){ lg('MQTT not connected — cannot send '+topic); return; }
+  if(!mqttConnected){ lg('MQTT not connected â€” cannot send '+topic); return; }
   try{
     var msg = new Paho.Message(payload==null?"":payload);
     msg.destinationName = topic;
@@ -478,7 +478,7 @@ function applyCfg(){
 function monStart(){ pubCmd('esp32/cmd/monitor/start',''); lg('> monitor start'); }
 function monStop(){ pubCmd('esp32/cmd/monitor/stop',''); lg('> monitor stop'); }
 
-/* chart drawing — mirrors html_content.h */
+/* chart drawing â€” mirrors html_content.h */
 function drawChartOn(cvId, spectra, wavelengths, labels, offsets){
   var cv=document.getElementById(cvId);
   if(!cv) return;
@@ -693,7 +693,7 @@ function renderExperiments(rows){
   for(var i=0;i<rows.length;i++){
     var r=rows[i];
     var tr=document.createElement('tr');
-    var dt=r.timestamp_ms?new Date(r.timestamp_ms).toLocaleString():'—';
+    var dt=r.timestamp_ms?new Date(r.timestamp_ms).toLocaleString():'â€”';
     tr.innerHTML =
       '<td>'+esc(r.exp_id)+'</td>'+
       '<td>'+esc(dt)+'</td>'+
@@ -824,7 +824,7 @@ function estSize(){
     sz.textContent='~'+Math.round(total*2.5)+' KB estimated';
   } else {
     var expId=document.getElementById('exSel').value;
-    sz.textContent=expId?'~5–20 KB per experiment':'';
+    sz.textContent=expId?'~5â€“20 KB per experiment':'';
   }
 }
 
@@ -837,9 +837,10 @@ setInterval(function(){
   if(document.getElementById('pane_exp').classList.contains('active')) loadExperiments(false);
 }, 30000);
 
-lg('UI ready — connecting to MQTT broker...');
+lg('UI ready â€” connecting to MQTT broker...');
 connectMQTT();
 loadExperiments(true);
 </script>
 </body>
 </html>
+

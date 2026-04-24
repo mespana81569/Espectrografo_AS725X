@@ -284,8 +284,77 @@ Single 2.4 GHz radio cannot scan while serving AP clients. Fixed by full radio c
 ### `netstack cb reg failed with 12308`
 Caused by cycling `WIFI_OFF → WIFI_STA → WIFI_OFF → WIFI_AP` (double netif init). Fixed by going directly `STA → AP` after scan, skipping the second `WIFI_OFF`.
 
+## Backend Stack (Docker)
+
+A four-service Compose stack under [docker-compose.yml](docker-compose.yml) provides storage, a REST API, a remote web UI, and an MQTT ingestion path. Bring up / tear down:
+
+```bash
+docker compose up -d            # start
+docker compose up -d --build    # rebuild after server/ changes
+docker compose down             # stop (keep data)
+docker compose down -v          # stop + wipe mysql_data volume (re-runs init.sql)
+```
+
+### Services
+
+| Service | Container | Image / Build | Ports | Role |
+|---|---|---|---|---|
+| `mosquitto` | `espectrografo_mqtt` | `eclipse-mosquitto:2.0` | 1883, 9001 | MQTT broker; listener 1883 TCP + 9001 WebSocket |
+| `mysql` | `espectrografo_db` | `mysql:8.4` | 3306 | Persistence; init.sql on first boot; healthcheck gates dependents |
+| `flask` | `espectrografo_flask` | [docker/Dockerfile.flask](docker/Dockerfile.flask) | 5000 | REST API + serves `control.html` at `/` |
+| `mqtt_bridge` | `espectrografo_bridge` | [docker/Dockerfile.mqtt_bridge](docker/Dockerfile.mqtt_bridge) | — | Subscribes to MQTT, writes into MySQL |
+
+Inside the Compose network, services reach each other by service name (`mosquitto`, `mysql`). From the host browser, use `localhost:9001` (WS) / `localhost:5000` (HTTP).
+
+### Config files
+
+- [docker/mosquitto.conf](docker/mosquitto.conf) — two listeners, `allow_anonymous true`. **Must be saved as UTF-8 without BOM** — a BOM makes mosquitto fail with `Unknown configuration variable "listener"`.
+- [docker/.env](docker/.env) — holds `MYSQL_ROOT_PASSWORD`, `MYSQL_PASSWORD` (read by Python code), `MYSQL_DATABASE`, `MQTT_BROKER`, `MQTT_PORT`. Both `MYSQL_ROOT_PASSWORD` and `MYSQL_PASSWORD` must match; the first initializes MySQL, the second is what `app.py`/`mqtt_to_db.py` read.
+- [docker/mysql-init/init.sql](docker/mysql-init/init.sql) — creates `experimentos`, `mediciones`, `calibraciones`. Only runs when `mysql_data` volume is empty.
+
+### MySQL schema (`espectrografo` database)
+
+- `experimentos(exp_id UNIQUE, timestamp_ms, num_measurements, gain, mode, int_cycles, led_*_ma, cal_valid)` — one row per experiment
+- `mediciones(exp_id FK, meas_index, ch1..ch18)` — one row per measurement
+- `calibraciones(exp_id FK, ch1..ch18)` — one row per experiment (blank offsets)
+
+### MQTT → DB ingestion — [server/mqtt_to_db.py](server/mqtt_to_db.py)
+
+Subscribes on `mosquitto:1883` to:
+
+| Topic | Handling |
+|---|---|
+| `esp32/data/upload` | Full experiment JSON → `INSERT IGNORE` into the three tables |
+| `esp32/data/spectra` | Same handling as `upload` (alias path) |
+| `esp32/data/status` | Logged heartbeat (state + rssi), not persisted |
+
+Uses `paho-mqtt` with `CallbackAPIVersion.VERSION2`. Reads `MQTT_BROKER`, `MQTT_PORT`, `MYSQL_*` from env.
+
+### REST API — [server/app.py](server/app.py) (Flask on port 5000)
+
+CORS open (`Access-Control-Allow-Origin: *`).
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/` | GET | Serves `control.html` |
+| `/history/experiments?limit=&offset=` | GET | Paginated experiment list (max limit 500) |
+| `/history/spectra?exp_id=` | GET | All spectra + calibration offsets for one experiment |
+| `/history/export/csv?exp_id=` or `?all=true` | GET | CSV download (single experiment or full dataset) |
+| `/history/export/json?exp_id=` or `?all=true` | GET | JSON download |
+| `/verify?exp_id=&expected=N` | GET | Confirms `mediciones` row count ≥ N — used by the ESP32 to decide whether to purge local SD data |
+
+### Remote UI — [server/control.html](server/control.html)
+
+Single-page HTML served by Flask. Connects to the MQTT broker over WebSockets via `paho-mqtt.js` (`MQTT_HOST`/`MQTT_PORT` constants at [control.html:253-254](server/control.html#L253-L254) — change `MQTT_HOST` from `localhost` if serving remotely). Sends control commands and receives live channel data by subscribing to ESP32 topics.
+
+### Gotchas observed during setup
+
+- **BOM in mosquitto.conf** — any editor that writes UTF-8 with BOM (e.g., Windows Notepad) breaks the broker. Re-save as UTF-8 (no BOM).
+- **Password env mismatch** — code reads `MYSQL_PASSWORD`; MySQL image only honors `MYSQL_ROOT_PASSWORD`. Both must be present in `.env` and must match. Changing `.env` after the data volume exists has no effect — use `docker compose down -v` to re-init.
+- **WebSocket listener** — browser MQTT requires `protocol websockets` on a distinct listener from the 1883 TCP one.
+- **`MQTT_PORT` default** — `mqtt_to_db.py` defaults to `1884`; docker-compose overrides it via env to `1883`. Don't rely on the default.
+
 ## Future Work
 
-- **Send to DB**: when user presses "Send to DB", connect to STA, POST SD data to a Docker REST API, delete local rows only after `200 OK` confirmed.
 - **NTP**: already wired (`configTime()` on STA connect); date column in CSV will auto-correct once ESP32 reaches internet.
 - **Experiment ID auto-increment**: handled in JavaScript after each successful save — no backend counter needed.

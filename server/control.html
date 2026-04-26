@@ -909,8 +909,17 @@ function wlClr(nm){
 function drawLive(data){
   var cv=document.getElementById('liveChart');
   if(!cv) return;
-  var ctx=cv.getContext('2d');
   var rect=cv.getBoundingClientRect();
+  // Card may still be display:none on the very first frame after the device
+  // transitions to LIVE_MONITOR (state event and monitor frame can arrive in
+  // the same MQTT batch).  Defer one animation frame so the canvas has real
+  // dimensions before we draw — otherwise we paint into a 0×0 buffer and the
+  // user sees nothing until we get lucky on a later resize.
+  if(rect.width < 10){
+    requestAnimationFrame(function(){ drawLive(data); });
+    return;
+  }
+  var ctx=cv.getContext('2d');
   var dpr=window.devicePixelRatio||1;
   cv.width=rect.width*dpr; cv.height=rect.height*dpr;
   ctx.setTransform(1,0,0,1,0,0);

@@ -102,6 +102,8 @@ MqttClient::MqttClient()
       _pendingConfig(false),
       _pendingConfigLen(0),
       _pendingPullData(false),
+      _pendingMonitorStart(false),
+      _pendingMonitorStop(false),
       _uploadState(UploadState::IDLE),
       _uploadSucceeded(false) {
     memset(_pendingConfigBuf, 0, sizeof(_pendingConfigBuf));
@@ -239,6 +241,8 @@ void MqttClient::subscribeAll() {
     _client.subscribe(MQTT_TOPIC_CMD_DISCARD);
     _client.subscribe(MQTT_TOPIC_CMD_CONFIG);
     _client.subscribe(MQTT_TOPIC_CMD_PULL_DATA);
+    _client.subscribe(MQTT_TOPIC_CMD_MONITOR_START);
+    _client.subscribe(MQTT_TOPIC_CMD_MONITOR_STOP);
     Serial.println("[MQTT] Subscribed to esp32/cmd/*");
 }
 
@@ -297,6 +301,10 @@ void MqttClient::handleCallback(const char* topic, const uint8_t* payload, unsig
         _pendingConfig = true;
     } else if (!strcmp(topic, MQTT_TOPIC_CMD_PULL_DATA)) {
         _pendingPullData = true;
+    } else if (!strcmp(topic, MQTT_TOPIC_CMD_MONITOR_START)) {
+        _pendingMonitorStart = true;
+    } else if (!strcmp(topic, MQTT_TOPIC_CMD_MONITOR_STOP)) {
+        _pendingMonitorStop = true;
     }
 }
 
@@ -353,6 +361,26 @@ void MqttClient::processPendingCommands() {
             triggerSDUpload();
         } else {
             Serial.println("[MQTT] pull_data ignored — upload already in progress");
+        }
+    }
+
+    if (_pendingMonitorStart) {
+        _pendingMonitorStart = false;
+        // Mirrors handleMonitorStart in api_routes.cpp: only enter live
+        // monitor from IDLE.  Without this gate the dashboard could yank
+        // the device out of an in-progress measurement.
+        if (g_stateMachine.getState() == SystemState::IDLE) {
+            g_stateMachine.requestTransition(SystemState::LIVE_MONITOR);
+        } else {
+            Serial.printf("[MQTT] monitor/start ignored — state %s\n",
+                          g_stateMachine.getStateName());
+        }
+    }
+
+    if (_pendingMonitorStop) {
+        _pendingMonitorStop = false;
+        if (g_stateMachine.getState() == SystemState::LIVE_MONITOR) {
+            g_stateMachine.requestTransition(SystemState::IDLE);
         }
     }
 

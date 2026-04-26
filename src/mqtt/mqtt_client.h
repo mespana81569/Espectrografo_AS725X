@@ -37,6 +37,12 @@
 #define MQTT_TOPIC_CMD_DISCARD   "esp32/cmd/discard"
 #define MQTT_TOPIC_CMD_CONFIG    "esp32/cmd/config"
 #define MQTT_TOPIC_CMD_PULL_DATA "esp32/cmd/pull_data"
+// Live Monitor — these used to be REST-only (the local UI POSTs to
+// /api/monitor/start|stop).  Without an MQTT handler the dashboard's button
+// publishes into the void, which is why the server-side Live Monitor never
+// initialised.  Added so dashboard and local UI behave identically.
+#define MQTT_TOPIC_CMD_MONITOR_START "esp32/cmd/monitor/start"
+#define MQTT_TOPIC_CMD_MONITOR_STOP  "esp32/cmd/monitor/stop"
 
 // Data (published) — ESP32 → control.html
 #define MQTT_TOPIC_DATA_STATE         "esp32/data/state"
@@ -132,6 +138,8 @@ private:
     char          _pendingConfigBuf[768];
 
     volatile bool _pendingPullData;
+    volatile bool _pendingMonitorStart;
+    volatile bool _pendingMonitorStop;
 
     // ─── SD bulk upload state ─────────────────────────────────────────────
     enum class UploadState : uint8_t {

@@ -132,7 +132,7 @@ static const char HTML_CONTENT[] PROGMEM = R"rawhtml(
 
   <!-- Spectra chart -->
   <div class="c full" id="chartCard">
-    <h2>Spectra (last 3 measurements)</h2>
+    <h2>Spectra &mdash; transmittance vs wavelength (last 3 measurements)</h2>
     <canvas id="chart" class="cv" height="240"></canvas>
   </div>
 
@@ -341,8 +341,46 @@ function poll(){
   });
 }
 
-/* ─── Canvas Chart ─────────────────────────────────────────────────────── */
+/* ─── Canvas Chart ──────────────────────────────────────────────────────────
+   Y-axis physics — Beer–Lambert spectroscopy:
+
+     The AS7265X reports per-channel light intensity as a unit-less integer
+     "count" that is proportional to photon flux during one integration window
+     (counts depend on gain × integration time, so they are NOT comparable
+     across runs without a reference).  The reference is the BLANK measurement
+     `offsets[i]` = I0(λᵢ).  The measurement value is stored as the SIGNED
+     differential `data.spectra[m][i] = Δ = I(λᵢ) − I0(λᵢ)`.  We reconstruct:
+
+         I        = Δ + I0                       [counts]
+         T(λ)     = I / I0                       [dimensionless, 0..~1]
+         T_pct    = T · 100                      [%]
+         A(λ)     = −log10(T)                    [absorbance, dimensionless]
+
+     Beer–Lambert (the governing law):  A(λ) = ε(λ) · c · ℓ
+     where ε is molar absorptivity, c concentration, ℓ path length.  We plot
+     T_pct so a value of 100 % is "as transparent as the blank" and lower
+     values mean more absorption.
+
+     If no calibration is present (calValid=false / I0 missing or zero) we
+     cannot compute T — we then fall back to plotting raw counts and label
+     the axis "Counts (uncalibrated)".
+   ──────────────────────────────────────────────────────────────────────── */
 function fin(v){ return (typeof v==='number' && isFinite(v)) ? v : 0; }
+
+// Convert one row of stored Δ values + the I0 reference into transmittance %.
+// Returns null if the calibration is unusable (any I0 ≤ 0 makes T undefined).
+function deltasToTransmittancePct(delta, offsets){
+  if(!offsets || !offsets.length || offsets.length!==delta.length) return null;
+  var out=new Array(delta.length);
+  for(var i=0;i<delta.length;i++){
+    var I0=fin(offsets[i]);
+    if(I0<=0) return null;                     // can't divide; abort whole row
+    var I = fin(delta[i]) + I0;                // recover sample intensity
+    if(I<0) I=0;                               // physical floor (no negative photon count)
+    out[i] = (I / I0) * 100.0;                 // transmittance, percent
+  }
+  return out;
+}
 
 function drawChart(data){
   var cv=document.getElementById('chart');
@@ -358,26 +396,44 @@ function drawChart(data){
 
   if(!data || !data.spectra) return;
 
+  var wl=data.wavelengths||[];
+  var offsets=(data.calValid && data.offsets && data.offsets.length===wl.length) ? data.offsets : null;
+
   // Defensive copy + sanitize non-finite values to 0 (prevents blank charts
-  // when sensor returns NaN/Inf on high-irradiance or post-config reads)
+  // when sensor returns NaN/Inf on high-irradiance or post-config reads).
+  // If calibration is valid, convert each row Δ → T% so the axis matches the
+  // physical quantity we claim to plot.
   var sp=[];
   var raw=data.spectra.slice(-3);
   for(var i=0;i<raw.length;i++){
     if(!raw[i] || !raw[i].length) continue;
     var row=[];
     for(var j=0;j<raw[i].length;j++) row.push(fin(raw[i][j]));
-    sp.push(row);
+    if(offsets){
+      var t=deltasToTransmittancePct(row, offsets);
+      sp.push(t || row);                       // fallback to Δ if conversion fails
+    } else {
+      sp.push(row);
+    }
   }
-  var wl=data.wavelengths||[];
   if(!sp.length||!wl.length)return;
 
-  var mx=0;
-  for(var i=0;i<sp.length;i++) for(var j=0;j<sp[i].length;j++){
-    if(sp[i][j]>mx) mx=sp[i][j];
-  }
-  if(!isFinite(mx) || mx<=0) mx=1;
+  var yLabel = offsets ? 'Transmittance (%)' : 'Counts (uncalibrated)';
 
-  var L=48,R=12,T=18,B=26;
+  // Fixed 0..100 axis when plotting transmittance — the percentage is bounded
+  // and a fixed scale makes the chart comparable across measurements.
+  var mx;
+  if(offsets){
+    mx=100;
+  } else {
+    mx=0;
+    for(var i=0;i<sp.length;i++) for(var j=0;j<sp[i].length;j++){
+      if(sp[i][j]>mx) mx=sp[i][j];
+    }
+    if(!isFinite(mx) || mx<=0) mx=1;
+  }
+
+  var L=52,R=12,T=18,B=38;
   var pW=W-L-R,pH=H-T-B;
 
   ctx.strokeStyle='#334155';ctx.lineWidth=0.5;
@@ -389,13 +445,23 @@ function drawChart(data){
   ctx.fillStyle='#94a3b8';ctx.font='9px sans-serif';ctx.textAlign='center';
   for(var i=0;i<wl.length;i+=3){
     var x=L+(i/(wl.length-1))*pW;
-    ctx.fillText(wl[i],x,H-4);
+    ctx.fillText(wl[i],x,H-22);
   }
   ctx.textAlign='right';
   for(var i=0;i<=4;i++){
     var y=T+pH*(1-i/4);
-    ctx.fillText((mx*i/4).toFixed(1),L-4,y+3);
+    ctx.fillText((mx*i/4).toFixed(offsets?0:1),L-4,y+3);
   }
+  // Axis titles — make the units explicit so the chart is self-describing.
+  ctx.fillStyle='#e2e8f0';ctx.font='11px sans-serif';
+  ctx.textAlign='center';
+  ctx.fillText('Wavelength (nm)', L+pW/2, H-6);
+  ctx.save();
+  ctx.translate(12, T+pH/2);
+  ctx.rotate(-Math.PI/2);
+  ctx.textAlign='center';
+  ctx.fillText(yLabel, 0, 0);
+  ctx.restore();
 
   var clr=['#38bdf8','#a78bfa','#34d399'];
   for(var s=0;s<sp.length;s++){
@@ -417,6 +483,22 @@ function drawChart(data){
     }
   }
 
+  // Overlay the blank reference (issue #4 — parity with the server UI).
+  // When plotting transmittance the reference IS the constant T = 100 %
+  // (T₀ = I₀ / I₀ ≡ 1).  When plotting raw counts we draw the offsets vector
+  // itself.  Dashed gray for both — same visual convention as control.html.
+  if(offsets){
+    ctx.strokeStyle='#94a3b8';ctx.lineWidth=1.4;
+    ctx.setLineDash([5,4]);ctx.beginPath();
+    for(var i=0;i<wl.length;i++){
+      var v=100;                   // offsets always renders as the 100% line in T-mode
+      var x=L+(i/(wl.length-1))*pW;
+      var y=T+pH*(1-v/mx);
+      if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();ctx.setLineDash([]);
+  }
+
   ctx.font='10px sans-serif';ctx.textAlign='left';
   var total=fin(data.count)||sp.length;
   for(var s=0;s<sp.length;s++){
@@ -424,6 +506,11 @@ function drawChart(data){
     ctx.fillStyle=clr[s%3];
     ctx.fillRect(lx,T+1,10,3);
     ctx.fillText('Meas '+(total-sp.length+s+1),lx+14,T+7);
+  }
+  if(offsets){
+    var lx=L+4+sp.length*80;
+    ctx.fillStyle='#94a3b8';ctx.fillRect(lx,T+1,10,3);
+    ctx.fillText('Blank ref. (T=100%)',lx+14,T+7);
   }
 }
 
@@ -508,11 +595,12 @@ function drawLive(data){
 }
 
 function monitorLoop(){
+  // Clarification #3 — 500 ms is the starting cadence we'll tune from.
   if(cur!=='LIVE_MONITOR'){setTimeout(monitorLoop,500);return;}
   api('/api/monitor').then(function(d){
     if(d&&d.ready)drawLive(d);
   });
-  setTimeout(monitorLoop,600);
+  setTimeout(monitorLoop,500);
 }
 
 /* ─── Self-scheduling loops ────────────────────────────────────────────── */

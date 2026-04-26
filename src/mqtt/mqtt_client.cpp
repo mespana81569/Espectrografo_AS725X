@@ -2,6 +2,7 @@
 
 #include <ArduinoJson.h>
 #include <SD.h>
+#include <math.h>
 #include <string.h>
 
 #include "../core/state_machine.h"
@@ -72,7 +73,10 @@ static void appendFloatArray(String& out, const float* v, int n, int decimals = 
     out += "[";
     for (int i = 0; i < n; i++) {
         if (i) out += ",";
-        out += String(v[i], decimals);
+        // NaN/Inf as JSON `null` — chart code treats null as "no value".
+        // Previously we emitted "nan" which broke the JS JSON.parse silently.
+        if (!isfinite(v[i])) out += "null";
+        else                 out += String(v[i], decimals);
     }
     out += "]";
 }
@@ -83,6 +87,12 @@ MqttClient::MqttClient()
     : _client(_wifiClient),
       _lastReconnectAttempt(0),
       _lastHeartbeat(0),
+      _lastLiveFrame(0),
+      _lastCalK(-1),
+      _lastMeasK(-1),
+      _groupRetries(0),
+      _uploadedOk(0),
+      _uploadedFail(0),
       _wasConnected(false),
       _pendingCalibrate(false),
       _pendingConfirm(false),
@@ -201,6 +211,14 @@ void MqttClient::tick() {
         _lastHeartbeat = now;
         publishHeartbeat();
     }
+
+    // 8) Live frames — drives the dashboard's progress bars and plots.
+    //    Throttled to 500 ms (clarification #3); each phase is a no-op
+    //    when the corresponding state machine state isn't active.
+    if (now - _lastLiveFrame >= LIVE_INTERVAL_MS) {
+        _lastLiveFrame = now;
+        publishLiveFrames();
+    }
 }
 
 bool MqttClient::attemptConnect() {
@@ -225,16 +243,27 @@ void MqttClient::subscribeAll() {
 }
 
 void MqttClient::triggerSDUpload() {
+    // Issue #9 — pull failures must be LOUD.  Previously this returned
+    // silently and the dashboard's "Pull from ESP32" button looked like it
+    // had succeeded.  Now every refusal publishes to the error topic so
+    // control.html can surface the message in its banner.
     if (!g_sdLogger.isReady()) {
-        Serial.println("[MQTT] SD not ready — skipping bulk upload");
+        Serial.println("[MQTT] SD not ready — refusing bulk upload");
+        _client.publish(MQTT_TOPIC_DATA_PULL_ERROR,
+                        "{\"requested\":\"all\",\"reason\":\"sd_not_ready\"}", false);
         return;
     }
     if (!SD.exists(LOG_FILE)) {
         Serial.println("[MQTT] No /spectra.csv to upload");
+        _client.publish(MQTT_TOPIC_DATA_PULL_ERROR,
+                        "{\"requested\":\"all\",\"reason\":\"no_data\"}", false);
         return;
     }
     _uploadState = UploadState::OPENING;
     _uploadSucceeded = false;
+    _groupRetries  = 0;
+    _uploadedOk    = 0;
+    _uploadedFail  = 0;
     memset(&_group, 0, sizeof(_group));
     s_lookaheadValid = false;
     Serial.println("[MQTT] Bulk upload scheduled");
@@ -337,7 +366,8 @@ void MqttClient::processPendingCommands() {
             if (err) {
                 Serial.printf("[MQTT] config parse error: %s\n", err.c_str());
             } else {
-                SensorConfig cfg = g_sensorDriver.getConfig();
+                SensorConfig prev = g_sensorDriver.getConfig();
+                SensorConfig cfg  = prev;
                 if (doc.containsKey("gain"))              cfg.gain              = (SensorGain)(uint8_t)doc["gain"];
                 if (doc.containsKey("integrationCycles")) cfg.integrationCycles = doc["integrationCycles"];
                 if (doc.containsKey("mode"))              cfg.mode              = (MeasurementMode)(uint8_t)doc["mode"];
@@ -347,6 +377,15 @@ void MqttClient::processPendingCommands() {
                 if (doc.containsKey("ledWhiteEnabled"))   cfg.ledWhiteEnabled   = doc["ledWhiteEnabled"];
                 if (doc.containsKey("ledIrEnabled"))      cfg.ledIrEnabled      = doc["ledIrEnabled"];
                 if (doc.containsKey("ledUvEnabled"))      cfg.ledUvEnabled      = doc["ledUvEnabled"];
+                if (doc.containsKey("nCal"))              cfg.nCal              = (uint8_t)doc["nCal"];
+                if (doc.containsKey("nCalUseSameAsN"))    cfg.nCalUseSameAsN    = doc["nCalUseSameAsN"];
+
+                // Same invariant as the REST handler — see api_routes.cpp.
+                if (!sensorConfigCountsComparable(prev, cfg) && g_calibration.getData().valid) {
+                    g_calibration.reset();
+                    Serial.println("[MQTT] sensor config changed — calibration invalidated");
+                }
+
                 g_sensorDriver.applyConfig(cfg);
 
                 if (doc.containsKey("N")) {
@@ -361,15 +400,89 @@ void MqttClient::processPendingCommands() {
     }
 }
 
+// ─── Live frames (issue #7 — feeds dashboard progress + live plot) ──────────
+//
+// All three publishers share the same throttling tick.  Payloads are kept
+// small (<256 B) so a 500 ms cadence is comfortable even over flaky links.
+// We also short-circuit a publish when the relevant counter hasn't moved —
+// no point spending broker bytes to confirm "still 3/5".
+
+extern float    g_liveBuf[18];
+extern volatile bool g_liveReady;
+
+void MqttClient::publishLiveFrames() {
+    if (!_client.connected()) return;
+    SystemState st = g_stateMachine.getState();
+
+    if (st == SystemState::CALIBRATION) {
+        int k = g_calibration.samplesCollected();
+        int n = g_calibration.samplesTarget();
+        if (k != _lastCalK) {
+            _lastCalK = k;
+            char buf[96];
+            int len = snprintf(buf, sizeof(buf),
+                               "{\"phase\":\"calibration\",\"k\":%d,\"n\":%d}", k, n);
+            _client.publish(MQTT_TOPIC_DATA_CAL_PROGRESS,
+                            (const uint8_t*)buf, len, false);
+        }
+    } else {
+        _lastCalK = -1;
+    }
+
+    if (st == SystemState::MEASUREMENT) {
+        const Experiment& exp = g_measurementEngine.getExperiment();
+        int k = exp.count;
+        int n = exp.num_measurements;
+        if (k != _lastMeasK && k > 0) {
+            _lastMeasK = k;
+            // Include the most recent row so the dashboard's "last
+            // measurements" plot can update incrementally — without this,
+            // users only see the experiment after it's fully uploaded.
+            String out;
+            out.reserve(384);
+            out += "{\"phase\":\"measurement\",\"uuid\":\"";
+            out += exp.uuid;
+            out += "\",\"exp_id\":\""; out += exp.experiment_id;
+            out += "\",\"k\":"; out += k; out += ",\"n\":"; out += n;
+            out += ",\"row\":";
+            appendFloatArray(out, exp.spectra[k - 1], NUM_CHANNELS);
+            out += "}";
+            _client.publish(MQTT_TOPIC_DATA_MEAS_PROGRESS, out.c_str(), false);
+        }
+    } else {
+        _lastMeasK = -1;
+    }
+
+    if (st == SystemState::LIVE_MONITOR && g_liveReady) {
+        String out;
+        out.reserve(384);
+        out += "{\"ch\":";
+        appendFloatArray(out, g_liveBuf, NUM_CHANNELS, 1);
+        out += ",\"wl\":";
+        appendWavelengths(out);
+        out += "}";
+        _client.publish(MQTT_TOPIC_DATA_MONITOR, out.c_str(), false);
+    }
+}
+
 // ─── Heartbeat ──────────────────────────────────────────────────────────────
 
 void MqttClient::publishHeartbeat() {
-    StaticJsonDocument<192> doc;
-    doc["state"]    = g_stateMachine.getStateName();
-    doc["rssi"]     = WiFi.RSSI();
-    doc["heap"]     = (int)ESP.getFreeHeap();
-    doc["sd_ready"] = g_sdLogger.isReady();
-    char buf[192];
+    const Experiment& exp = g_measurementEngine.getExperiment();
+    const CalibrationData& cal = g_calibration.getData();
+    StaticJsonDocument<384> doc;
+    doc["state"]      = g_stateMachine.getStateName();
+    doc["rssi"]       = WiFi.RSSI();
+    doc["heap"]       = (int)ESP.getFreeHeap();
+    doc["sd_ready"]   = g_sdLogger.isReady();
+    doc["uuid"]       = exp.uuid;
+    doc["exp_id"]     = exp.experiment_id;
+    doc["calValid"]   = cal.valid;
+    doc["calProgress"] = g_calibration.samplesCollected();
+    doc["calTarget"]   = g_calibration.samplesTarget();
+    doc["measCount"]  = exp.count;
+    doc["measTarget"] = exp.num_measurements;
+    char buf[384];
     size_t n = serializeJson(doc, buf, sizeof(buf));
     _client.publish(MQTT_TOPIC_DATA_STATUS, (const uint8_t*)buf, n, false);
 }
@@ -379,32 +492,43 @@ void MqttClient::publishHeartbeat() {
 String MqttClient::buildExperimentJson(const Experiment& exp) {
     String out;
     out.reserve(4096);
-    out += "{\"exp_id\":\"";
-    out += exp.experiment_id;
-    out += "\",\"timestamp_ms\":";
-    out += (unsigned long)exp.timestamp;
-    out += ",\"num_measurements\":";
-    out += exp.num_measurements;
-    out += ",\"sensor\":{\"gain\":";
-    out += (int)(uint8_t)exp.sensor_cfg.gain;
-    out += ",\"mode\":";
-    out += (int)(uint8_t)exp.sensor_cfg.mode;
-    out += ",\"int_cycles\":";
-    out += (int)exp.sensor_cfg.integrationCycles;
-    out += ",\"led_white_ma\":";
-    out += exp.sensor_cfg.ledWhiteEnabled ? (int)exp.sensor_cfg.ledWhiteCurrent : 0;
-    out += ",\"led_ir_ma\":";
-    out += exp.sensor_cfg.ledIrEnabled    ? (int)exp.sensor_cfg.ledIrCurrent    : 0;
-    out += ",\"led_uv_ma\":";
-    out += exp.sensor_cfg.ledUvEnabled    ? (int)exp.sensor_cfg.ledUvCurrent    : 0;
+    out += "{\"uuid\":\"";          out += exp.uuid;
+    out += "\",\"exp_id\":\"";      out += exp.experiment_id;
+    out += "\",\"timestamp_ms\":";  out += (unsigned long)exp.timestamp;
+    out += ",\"num_measurements\":"; out += exp.num_measurements;
+    out += ",\"n_cal\":";           out += (int)exp.calibration.n_used;
+    out += ",\"sensor\":{\"gain\":"; out += (int)(uint8_t)exp.sensor_cfg.gain;
+    out += ",\"mode\":";            out += (int)(uint8_t)exp.sensor_cfg.mode;
+    out += ",\"int_cycles\":";      out += (int)exp.sensor_cfg.integrationCycles;
+    out += ",\"led_white_ma\":";    out += (int)exp.sensor_cfg.ledWhiteCurrent;
+    out += ",\"led_ir_ma\":";       out += (int)exp.sensor_cfg.ledIrCurrent;
+    out += ",\"led_uv_ma\":";       out += (int)exp.sensor_cfg.ledUvCurrent;
+    out += ",\"led_white_on\":";    out += exp.sensor_cfg.ledWhiteEnabled ? "true" : "false";
+    out += ",\"led_ir_on\":";       out += exp.sensor_cfg.ledIrEnabled    ? "true" : "false";
+    out += ",\"led_uv_on\":";       out += exp.sensor_cfg.ledUvEnabled    ? "true" : "false";
     out += "},\"calibration\":{\"valid\":";
     out += exp.calibration.valid ? "true" : "false";
     out += ",\"offsets\":";
     appendFloatArray(out, exp.calibration.offset, NUM_CHANNELS);
-    out += "},\"spectra\":[";
+    out += ",\"cfg_at_cal\":{\"gain\":";
+    out += (int)(uint8_t)exp.calibration.cfg_at_cal.gain;
+    out += ",\"int_cycles\":";
+    out += (int)exp.calibration.cfg_at_cal.integrationCycles;
+    out += "}},\"spectra\":[";
     for (int i = 0; i < exp.count; i++) {
         if (i) out += ",";
         appendFloatArray(out, exp.spectra[i], NUM_CHANNELS);
+    }
+    // Processed values from MeasurementEngine::computeProcessed().
+    out += "],\"transmittance\":[";
+    for (int i = 0; i < exp.count; i++) {
+        if (i) out += ",";
+        appendFloatArray(out, exp.transmittance[i], NUM_CHANNELS, 3);
+    }
+    out += "],\"absorbance\":[";
+    for (int i = 0; i < exp.count; i++) {
+        if (i) out += ",";
+        appendFloatArray(out, exp.absorbance[i], NUM_CHANNELS, 4);
     }
     out += "],\"wavelengths_nm\":";
     appendWavelengths(out);
@@ -412,34 +536,50 @@ String MqttClient::buildExperimentJson(const Experiment& exp) {
     return out;
 }
 
+// Group payload reconstructed from CSV during the SD bulk-upload pass.
+//
+// IMPORTANT: this payload contains ONLY raw Δ + offsets — transmittance and
+// absorbance are NOT included.  Reasoning:
+//   * Each (T row + A row) doubles the byte count vs. raw alone.  A 20-
+//     measurement experiment with raw+T+A pushed past the historical 4 KB
+//     buffer and any oversized publish silently fails (PubSubClient returns
+//     false; the previous code "logged FAIL" and moved on, dropping the
+//     entire experiment).
+//   * The bridge (server/mqtt_to_db.py) recomputes T+A from raw+offsets on
+//     ingest — same math, no data dependence.  See store_experiment().
+// Live-side spectra publishes (publishExperiment) still include T+A because
+// they're produced fresh on-device and the dashboard wants to render them
+// without waiting for the bridge round-trip.
 String MqttClient::buildGroupJson() const {
     String out;
-    out.reserve(4096);
-    out += "{\"exp_id\":\"";
-    out += _group.exp_id;
-    out += "\",\"timestamp_ms\":0,\"num_measurements\":";
-    out += _group.count;
-    out += ",\"sensor\":{\"gain\":";
-    out += _group.gain_int;
-    out += ",\"mode\":";
-    out += _group.mode;
-    out += ",\"int_cycles\":";
-    out += _group.int_cycles;
-    out += ",\"led_white_ma\":";
-    out += _group.led_white_en ? _group.led_white_ma : 0;
-    out += ",\"led_ir_ma\":";
-    out += _group.led_ir_en    ? _group.led_ir_ma    : 0;
-    out += ",\"led_uv_ma\":";
-    out += _group.led_uv_en    ? _group.led_uv_ma    : 0;
+    out.reserve(8192);
+    out += "{\"uuid\":\"";          out += _group.uuid;
+    out += "\",\"exp_id\":\"";      out += _group.exp_id;
+    out += "\",\"timestamp_ms\":0,\"num_measurements\":"; out += _group.count;
+    out += ",\"n_cal\":0";  // not preserved in the CSV layout — best-effort
+    out += ",\"sensor\":{\"gain\":";  out += _group.gain_int;
+    out += ",\"mode\":";              out += _group.mode;
+    out += ",\"int_cycles\":";        out += _group.int_cycles;
+    out += ",\"led_white_ma\":";      out += _group.led_white_ma;
+    out += ",\"led_ir_ma\":";         out += _group.led_ir_ma;
+    out += ",\"led_uv_ma\":";         out += _group.led_uv_ma;
+    out += ",\"led_white_on\":";      out += _group.led_white_en ? "true" : "false";
+    out += ",\"led_ir_on\":";         out += _group.led_ir_en    ? "true" : "false";
+    out += ",\"led_uv_on\":";         out += _group.led_uv_en    ? "true" : "false";
     out += "},\"calibration\":{\"valid\":";
     out += _group.cal_valid ? "true" : "false";
     out += ",\"offsets\":";
     appendFloatArray(out, _group.offsets, NUM_CHANNELS);
-    out += "},\"spectra\":[";
+    out += ",\"cfg_at_cal\":{\"gain\":"; out += _group.gain_int;
+    out += ",\"int_cycles\":";           out += _group.int_cycles;
+    out += "}},\"spectra\":[";
     for (int i = 0; i < _group.count; i++) {
         if (i) out += ",";
         appendFloatArray(out, _group.spectra[i], NUM_CHANNELS);
     }
+    // T+A intentionally OMITTED here (see header docblock above) — bridge
+    // recomputes them from raw + offsets so the bulk-upload payload stays
+    // small enough to never overflow the MQTT buffer.
     out += "],\"wavelengths_nm\":";
     appendWavelengths(out);
     out += "}";
@@ -464,12 +604,20 @@ void MqttClient::processUploadTick() {
             _uploadState = UploadState::READING;
         } else {
             Serial.println("[MQTT] Upload: failed to open file");
+            _client.publish(MQTT_TOPIC_DATA_PULL_ERROR,
+                            "{\"requested\":\"all\",\"reason\":\"open_failed\"}", false);
             _uploadState = UploadState::IDLE;
         }
         return;
     }
 
     if (_uploadState == UploadState::READING) {
+        // If there's still a buffered group from a failed previous publish,
+        // try it again (don't read another row until this one drains).
+        if (_group.count > 0 && _groupRetries > 0) {
+            uploadPublishCurrentGroup();
+            return;
+        }
         if (uploadReadNextGroup()) {
             uploadPublishCurrentGroup();
         } else {
@@ -503,28 +651,48 @@ bool MqttClient::uploadOpenFile() {
 // Parse one CSV line into the group buffer. If lineIsFirstOfGroup, populate
 // the header/config/calibration slots; always append the spectra row.
 // Returns false on malformed row (row skipped).
+//
+// New column layout (after R1 / clarification #6):
+//   col 0  uuid           (RFC 4122 v4 string)
+//   col 1  exp_id         (user label)
+//   col 2  date
+//   col 3  meas_idx
+//   col 4  gain           (numeric AS7265X enum 0..3)
+//   col 5  int_cycles
+//   col 6  white_led      ("ON"/"OFF")
+//   col 7  white_mA
+//   col 8  ir_led         ("ON"/"OFF")
+//   col 9  ir_mA
+//   col 10 uv_led         ("ON"/"OFF")
+//   col 11 uv_mA
+//   col 12..29  cal_*18  (blank reference per channel)
+//   col 30..47  ch_*18   (Δ counts per channel)
+// → 12 metadata + 18 cal + 18 meas = 48 columns.
 static bool parseRowIntoGroup(char* line, MqttClient::UploadGroup& g, bool isFirstOfGroup) {
     char* fields[64];
     int nf = splitCsv(line, fields, 64);
-    // Expected columns: 11 metadata + 18 cal + 18 meas = 47
-    if (nf < 47) return false;
+    if (nf < 48) return false;
 
     if (isFirstOfGroup) {
-        strncpy(g.exp_id, fields[1], sizeof(g.exp_id) - 1);
-        g.exp_id[sizeof(g.exp_id) - 1] = 0;
-        g.gain_int     = gainStrToInt(fields[3]);
-        g.int_cycles   = atoi(fields[4]);
-        g.mode         = 3;  // not stored in CSV; Mode 3 is the only one logged
-        g.led_white_en = (!strcmp(fields[5], "ON"));
-        g.led_white_ma = atoi(fields[6]);
-        g.led_ir_en    = (!strcmp(fields[7], "ON"));
-        g.led_ir_ma    = atoi(fields[8]);
-        g.led_uv_en    = (!strcmp(fields[9], "ON"));
-        g.led_uv_ma    = atoi(fields[10]);
+        strncpy(g.uuid,   fields[0], sizeof(g.uuid)   - 1); g.uuid[sizeof(g.uuid)   - 1] = 0;
+        strncpy(g.exp_id, fields[1], sizeof(g.exp_id) - 1); g.exp_id[sizeof(g.exp_id) - 1] = 0;
+        // gain column is now numeric (sd_logger writes int casted from enum).
+        // atoi("16x") returns 16 — wrong; with the new schema we always get
+        // a small int 0..3.  Defensive: if the field is empty fall back to 16x.
+        g.gain_int     = (fields[4][0] >= '0' && fields[4][0] <= '9')
+                         ? atoi(fields[4]) : gainStrToInt(fields[4]);
+        g.int_cycles   = atoi(fields[5]);
+        g.mode         = 3;
+        g.led_white_en = (!strcmp(fields[6],  "ON"));
+        g.led_white_ma = atoi(fields[7]);
+        g.led_ir_en    = (!strcmp(fields[8],  "ON"));
+        g.led_ir_ma    = atoi(fields[9]);
+        g.led_uv_en    = (!strcmp(fields[10], "ON"));
+        g.led_uv_ma    = atoi(fields[11]);
 
         bool anyNonZero = false;
         for (int i = 0; i < NUM_CHANNELS; i++) {
-            g.offsets[i] = atof(fields[11 + i]);
+            g.offsets[i] = atof(fields[12 + i]);
             if (g.offsets[i] != 0.0f) anyNonZero = true;
         }
         g.cal_valid = anyNonZero;
@@ -533,7 +701,7 @@ static bool parseRowIntoGroup(char* line, MqttClient::UploadGroup& g, bool isFir
 
     if (g.count < MAX_MEASUREMENTS) {
         for (int i = 0; i < NUM_CHANNELS; i++) {
-            g.spectra[g.count][i] = atof(fields[29 + i]);
+            g.spectra[g.count][i] = atof(fields[30 + i]);
         }
         g.count++;
     }
@@ -556,30 +724,31 @@ bool MqttClient::uploadReadNextGroup() {
         String line = s_uploadFile.readStringUntil('\n');
         if (line.length() == 0) continue;
 
-        // Peek the exp_id of this row without consuming it first: copy, split,
-        // then decide whether it belongs to the current group.
+        // Peek the uuid (column 0) without consuming the row: copy, split,
+        // then decide whether it belongs to the current group.  Grouping by
+        // uuid (R1) is rename-safe AND collision-safe: two consecutive
+        // experiments named "agua" with different uuids will NOT be merged.
         char buf[2048];
         line.toCharArray(buf, sizeof(buf));
         char* fields[64];
         int nf = splitCsv(buf, fields, 64);
-        if (nf < 47) continue;  // malformed, skip
+        if (nf < 48) continue;  // malformed, skip
 
         if (_group.count == 0) {
-            // Fresh group — seed from this row.
             char buf2[2048];
             line.toCharArray(buf2, sizeof(buf2));
             parseRowIntoGroup(buf2, _group, true);
             continue;
         }
 
-        if (strcmp(fields[1], _group.exp_id) != 0) {
+        if (strcmp(fields[0], _group.uuid) != 0) {
             // New experiment — stash for next call, return current for publish.
             s_lookaheadLine = line;
             s_lookaheadValid = true;
             return true;
         }
 
-        // Same exp_id — append spectra row to current group.
+        // Same uuid — append spectra row to current group.
         char buf3[2048];
         line.toCharArray(buf3, sizeof(buf3));
         parseRowIntoGroup(buf3, _group, false);
@@ -592,12 +761,53 @@ bool MqttClient::uploadReadNextGroup() {
 void MqttClient::uploadPublishCurrentGroup() {
     if (_group.count == 0) return;
     String json = buildGroupJson();
+    size_t bytes = json.length();
     bool ok = _client.publish(MQTT_TOPIC_DATA_UPLOAD, json.c_str(), false);
-    Serial.printf("[MQTT] upload exp='%s' count=%d bytes=%u %s\n",
-                  _group.exp_id, _group.count,
-                  (unsigned)json.length(), ok ? "ok" : "FAIL");
+    Serial.printf("[MQTT] upload exp='%s' uuid=%s count=%d bytes=%u %s\n",
+                  _group.exp_id, _group.uuid, _group.count,
+                  (unsigned)bytes, ok ? "ok" : "FAIL");
+
+    if (!ok) {
+        _groupRetries++;
+        if (_groupRetries < UPLOAD_MAX_RETRIES) {
+            // Likely causes: oversized packet (publish() returns false when
+            // it can't fit), broker socket transient.  Keep _group buffered
+            // and try again next tick.  We do NOT advance the file cursor
+            // so no other experiment is touched in the meantime.
+            Serial.printf("[MQTT] upload retry %d/%d for uuid=%s (bytes=%u)\n",
+                          _groupRetries, UPLOAD_MAX_RETRIES,
+                          _group.uuid, (unsigned)bytes);
+            return;
+        }
+        // Persistent failure — give up on THIS experiment, surface it loudly,
+        // and continue with the next one so a single bad payload can't wedge
+        // the whole pull session.
+        char err[192];
+        snprintf(err, sizeof(err),
+                 "{\"requested\":\"%s\",\"exp_id\":\"%s\",\"reason\":\"publish_failed\","
+                 "\"bytes\":%u,\"buffer\":%u}",
+                 _group.uuid, _group.exp_id,
+                 (unsigned)bytes, (unsigned)MQTT_MAX_PACKET_SIZE);
+        _client.publish(MQTT_TOPIC_DATA_PULL_ERROR, err, false);
+        _uploadedFail++;
+        Serial.printf("[MQTT] upload GIVE UP uuid=%s after %d attempts\n",
+                      _group.uuid, _groupRetries);
+        // The pending flag for this uuid stays — next pull will re-attempt.
+        // Fall through to clear the buffer so the next group can be read.
+    } else {
+        _uploadedOk++;
+        // Per-experiment progress event so the dashboard's banner can show
+        // "uploading 3/10..." live, mirroring the local UI's progress bar.
+        char prog[160];
+        snprintf(prog, sizeof(prog),
+                 "{\"phase\":\"upload\",\"uuid\":\"%s\",\"exp_id\":\"%s\","
+                 "\"ok\":%d,\"fail\":%d}",
+                 _group.uuid, _group.exp_id, _uploadedOk, _uploadedFail);
+        _client.publish("esp32/data/upload/progress", prog, false);
+    }
     // Clear so uploadReadNextGroup knows the buffer is empty for the next pass.
-    _group.count = 0;
+    _group.count   = 0;
+    _groupRetries  = 0;
 }
 
 void MqttClient::uploadFinish() {
@@ -605,14 +815,26 @@ void MqttClient::uploadFinish() {
     s_lookaheadValid = false;
 
     if (_uploadSucceeded) {
-        if (SD.remove(LOG_FILE)) {
-            Serial.println("[MQTT] /spectra.csv deleted after upload");
-        } else {
-            Serial.println("[MQTT] WARNING: could not delete /spectra.csv");
-        }
-        // Re-create the empty CSV with header so future saves still work.
-        g_sdLogger.ensureHeader();
+        // *** DO NOT delete /spectra.csv here. ***
+        // A successful publish over MQTT only means the broker accepted the
+        // packet — it does NOT mean the bridge ingested it into MySQL.  The
+        // safe protocol is:
+        //   1. saveExperiment() left a /pending/<uuid>.json flag (already done).
+        //   2. We just finished publishing every CSV row to the broker.
+        //   3. cleanupVerifiedExperiments() will (a) HTTP-GET /verify per
+        //      pending exp, (b) drop only the verified exp's rows from the
+        //      CSV via removeExperimentRows(), (c) clear the flag, and
+        //      (d) remove the CSV entirely once /pending is empty.
+        // Anything that fails verification keeps its flag and its CSV rows,
+        // so the next pull_data re-publishes pending + new data.
         _client.publish(MQTT_TOPIC_DATA_STATE, "UPLOAD_COMPLETE", false);
     }
-    Serial.println("[MQTT] bulk upload finished");
+    // Final summary so the dashboard can show "uploaded N of M (K failed)".
+    char done[192];
+    snprintf(done, sizeof(done),
+             "{\"ok\":%d,\"fail\":%d,\"buffer\":%u}",
+             _uploadedOk, _uploadedFail, (unsigned)MQTT_MAX_PACKET_SIZE);
+    _client.publish("esp32/data/upload/done", done, false);
+    Serial.printf("[MQTT] bulk upload finished — ok=%d fail=%d (verify pass next)\n",
+                  _uploadedOk, _uploadedFail);
 }

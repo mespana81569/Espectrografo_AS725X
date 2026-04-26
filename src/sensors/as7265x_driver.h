@@ -27,7 +27,28 @@ struct SensorConfig {
     bool            ledWhiteEnabled   = false;
     bool            ledIrEnabled      = false;
     bool            ledUvEnabled      = false;
+    // N samples averaged for the blank reference at calibration time.  When
+    // `nCalUseSameAsN` is true (Option A from clarification #6) this field is
+    // ignored and CALIBRATION_AVERAGES = N (the measurement count).
+    uint8_t         nCal              = 5;
+    bool            nCalUseSameAsN    = true;
 };
+
+// True when two configs would produce comparable counts for transmittance.
+// Counts scale with gain × integration time × per-LED state, so any of those
+// changing makes a previous I0 reference unusable as a divisor.  Mode change
+// is included because non-Mode-3 reads emit fewer channels.
+inline bool sensorConfigCountsComparable(const SensorConfig& a, const SensorConfig& b) {
+    return a.gain              == b.gain
+        && a.integrationCycles == b.integrationCycles
+        && a.mode              == b.mode
+        && a.ledWhiteEnabled   == b.ledWhiteEnabled
+        && a.ledIrEnabled      == b.ledIrEnabled
+        && a.ledUvEnabled      == b.ledUvEnabled
+        && a.ledWhiteCurrent   == b.ledWhiteCurrent
+        && a.ledIrCurrent      == b.ledIrCurrent
+        && a.ledUvCurrent      == b.ledUvCurrent;
+}
 
 class AS7265xDriver {
 public:

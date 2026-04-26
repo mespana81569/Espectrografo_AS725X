@@ -56,10 +56,20 @@ void StateMachine::enterState(SystemState s) {
         case SystemState::IDLE:
             g_sensorDriver.setSleepMode(true);
             break;
-        case SystemState::CALIBRATION:
+        case SystemState::CALIBRATION: {
             g_sensorDriver.setSleepMode(false);
-            g_calibration.start();
+            // Honour the user's "use same N for cal as for measurement" toggle
+            // (clarification #3 / Option A).  When ON, calibration averages
+            // the same N as the experiment will; when OFF, the user-set nCal
+            // applies.  Either way the value is recorded in CalibrationData
+            // so the dashboard's config table can show it (issue #1).
+            SensorConfig cfg = g_sensorDriver.getConfig();
+            uint8_t n_cal = cfg.nCalUseSameAsN
+                            ? (uint8_t)g_measurementEngine.getExperiment().num_measurements
+                            : cfg.nCal;
+            g_calibration.start(n_cal);
             break;
+        }
         case SystemState::WAIT_CONFIRMATION:
             g_sensorDriver.setSleepMode(true);
             break;
@@ -82,7 +92,11 @@ void StateMachine::enterState(SystemState s) {
 void StateMachine::exitState(SystemState s) {
     switch (s) {
         case SystemState::CALIBRATION:
-            g_sdLogger.saveCalibration(g_calibration.getData());
+            // Calibration is no longer persisted as a standalone global file.
+            // It persists when the user saves the experiment (state machine
+            // transition SAVE_DECISION → IDLE), via saveExperiment(), which
+            // appends both the channels AND the calibration row keyed by
+            // uuid (R6 — calibration always travels with its experiment).
             g_calibration.clearDoneFlag();
             break;
         default:

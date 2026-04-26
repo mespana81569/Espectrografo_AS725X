@@ -11,6 +11,10 @@ SDLogger g_sdLogger;
 
 static SPIClass sdSPI(VSPI);
 
+// Forward decl — defined after ensureHeader so the two header-writers stay
+// adjacent in the source.  begin() calls it on a fresh card.
+static bool ensureCalibrationsHeader();
+
 SDLogger::SDLogger() : _ready(false) {}
 
 bool SDLogger::begin() {
@@ -21,7 +25,62 @@ bool SDLogger::begin() {
         return false;
     }
     _ready = true;
+    // ── Boot-time legacy CSV detection ────────────────────────────────────
+    // The schema gained a `uuid` column at index 0.  Any pre-update CSV has
+    // 47 fields per row; the new bulk-upload parser requires 48 and SILENTLY
+    // skips short rows — if we don't intervene, every legacy row uploads as
+    // zero experiments and the user sees "only 3 of 10 made it".  Detect by
+    // checking the header line; if it doesn't start with "uuid," we rename
+    // the file aside (NEVER delete) so the user can salvage it manually.
+    auto isLegacy = [](const char* path, const char* expectFirstCol) -> bool {
+        if (!SD.exists(path)) return false;
+        File f = SD.open(path, FILE_READ);
+        if (!f) return false;
+        String header = f.readStringUntil('\n');
+        f.close();
+        size_t L = strlen(expectFirstCol);
+        return !(header.length() >= L &&
+                 memcmp(header.c_str(), expectFirstCol, L) == 0);
+    };
+    if (isLegacy(LOG_FILE, "uuid,")) {
+        Serial.println("[SD] /spectra.csv has pre-uuid schema — renaming to /spectra.legacy.csv");
+        if (SD.exists("/spectra.legacy.csv")) SD.remove("/spectra.legacy.csv");
+        SD.rename(LOG_FILE, "/spectra.legacy.csv");
+    }
+    if (isLegacy(CAL_FILE, "uuid,")) {
+        Serial.println("[SD] /calibrations.csv has pre-uuid schema — renaming to /calibrations.legacy.csv");
+        if (SD.exists("/calibrations.legacy.csv")) SD.remove("/calibrations.legacy.csv");
+        SD.rename(CAL_FILE, "/calibrations.legacy.csv");
+    }
+    // Stale pending flags from the pre-uuid firmware lack the `uuid` field —
+    // readPendingFile() rejects them, so they would just accumulate forever
+    // and block the cleanup pass from ever wiping the SD.  Sweep them once.
+    if (SD.exists(PENDING_DIR)) {
+        File dir = SD.open(PENDING_DIR);
+        if (dir && dir.isDirectory()) {
+            File entry;
+            while ((entry = dir.openNextFile())) {
+                String name = entry.name();
+                int sl = name.lastIndexOf('/');
+                String base = (sl >= 0) ? name.substring(sl + 1) : name;
+                entry.close();
+                if (!base.endsWith(".json")) continue;
+                String full = String(PENDING_DIR) + "/" + base;
+                File pf = SD.open(full.c_str(), FILE_READ);
+                if (!pf) continue;
+                StaticJsonDocument<256> d;
+                DeserializationError er = deserializeJson(d, pf);
+                pf.close();
+                if (er || !(d["uuid"] | "")[0]) {
+                    Serial.printf("[SD] Removing stale pending flag (no uuid): %s\n", full.c_str());
+                    SD.remove(full);
+                }
+            }
+            dir.close();
+        }
+    }
     ensureHeader();
+    ensureCalibrationsHeader();
     if (!SD.exists(PENDING_DIR)) {
         SD.mkdir(PENDING_DIR);
     }
@@ -73,8 +132,8 @@ bool SDLogger::ensureHeader() {
         return false;
     }
 
-    // Header: date, experiment info, config, calibration 18ch, measurement 18ch
-    f.print("date,exp_id,meas_idx,gain,int_cycles,");
+    // Header: uuid (R1) + date + label + meas_idx + config + 18 cal cols + 18 meas cols.
+    f.print("uuid,exp_id,date,meas_idx,gain,int_cycles,");
     f.print("white_led,white_mA,ir_led,ir_mA,uv_led,uv_mA,");
     f.print("cal_A_410,cal_B_435,cal_C_460,cal_D_485,cal_E_510,cal_F_535,");
     f.print("cal_G_560,cal_H_585,cal_I_610,cal_J_645,cal_K_680,cal_L_705,");
@@ -87,6 +146,26 @@ bool SDLogger::ensureHeader() {
     return true;
 }
 
+// Companion file written alongside spectra.csv: one row per experiment.  Lets
+// the dashboard ingest just the calibration on import (clarification #7) and
+// keeps the binding explicit even when reading the SD outside the device.
+static bool ensureCalibrationsHeader() {
+    if (SD.exists(CAL_FILE)) {
+        File chk = SD.open(CAL_FILE, FILE_READ);
+        if (chk && chk.size() > 0) { chk.close(); return true; }
+        if (chk) chk.close();
+    }
+    File f = SD.open(CAL_FILE, FILE_WRITE);
+    if (!f) return false;
+    f.print("uuid,exp_id,date,gain_int,int_cycles,");
+    f.print("led_white_ma,led_white_on,led_ir_ma,led_ir_on,led_uv_ma,led_uv_on,n_cal,cal_valid,");
+    f.println("ref_ch1,ref_ch2,ref_ch3,ref_ch4,ref_ch5,ref_ch6,"
+              "ref_ch7,ref_ch8,ref_ch9,ref_ch10,ref_ch11,ref_ch12,"
+              "ref_ch13,ref_ch14,ref_ch15,ref_ch16,ref_ch17,ref_ch18");
+    f.close();
+    return true;
+}
+
 // ─── Save experiment ─────────────────────────────────────────────────────────
 
 bool SDLogger::saveExperiment(const Experiment& exp) {
@@ -94,6 +173,11 @@ bool SDLogger::saveExperiment(const Experiment& exp) {
         Serial.println("[SD] Not ready, cannot save");
         return false;
     }
+
+    // Write the calibration row first — that way if the spectra append fails
+    // mid-experiment, the calibration is at least recoverable (and the
+    // pending flag won't be created either, so no orphan reference).
+    appendCalibration(exp);
 
     // *** FILE_APPEND — critical: do NOT use FILE_WRITE, it truncates! ***
     File f = SD.open(LOG_FILE, FILE_APPEND);
@@ -109,10 +193,12 @@ bool SDLogger::saveExperiment(const Experiment& exp) {
     const CalibrationData& cal = exp.calibration;
 
     for (int i = 0; i < exp.count; i++) {
-        // Date + experiment info
-        f.print(date);           f.print(',');
+        // uuid + label first — so consumers can group rows without parsing
+        // dates (which carry timestamps that may equal-up across rows).
+        f.print(exp.uuid);          f.print(',');
         f.print(exp.experiment_id); f.print(',');
-        f.print(i);             f.print(',');
+        f.print(date);              f.print(',');
+        f.print(i);                 f.print(',');
 
         // Config — readable strings
         f.print(gainStr(cfg.gain)); f.print(',');
@@ -146,35 +232,56 @@ bool SDLogger::saveExperiment(const Experiment& exp) {
     f.close();
     Serial.printf("[SD] Saved %d rows for exp '%s'\n", exp.count, exp.experiment_id);
 
-    // Mark experiment pending DB verification — must persist across reboots
-    markPending(exp.experiment_id, exp.count);
+    // Mark experiment pending DB verification — must persist across reboots.
+    // Keyed by uuid so the verify path is rename-safe (R1).
+    markPending(exp.uuid, exp.experiment_id, exp.count);
     return true;
 }
 
-// ─── Save calibration (separate file, for quick reference) ───────────────────
+// ─── Append calibration (per-experiment binding, R6) ─────────────────────────
+//
+// One row per experiment, keyed by uuid + exp_id.  This is the data shape the
+// import flow on the dashboard expects (clarification #7) and the format the
+// device's offline pull mirrors.
 
-bool SDLogger::saveCalibration(const CalibrationData& cal) {
+bool SDLogger::appendCalibration(const Experiment& exp) {
     if (!_ready) {
-        Serial.println("[SD] Not ready, cannot save calibration");
+        Serial.println("[SD] Not ready, cannot append calibration");
         return false;
     }
+    ensureCalibrationsHeader();
 
-    File f = SD.open(CAL_FILE, FILE_WRITE);  // overwrite is intentional here
+    File f = SD.open(CAL_FILE, FILE_APPEND);
     if (!f) {
-        Serial.println("[SD] Failed to open calibration file");
+        Serial.println("[SD] Failed to open calibrations file for append");
         return false;
     }
 
-    f.print("channel,wavelength,offset,reference\n");
-    const uint16_t wl[] = {410,435,460,485,510,535,560,585,610,645,680,705,730,760,810,860,900,940};
-    for (int i = 0; i < NUM_CHANNELS; i++) {
-        char line[64];
-        snprintf(line, sizeof(line), "%d,%u,%.4f,%.4f\n", i, wl[i], cal.offset[i], cal.reference[i]);
-        f.print(line);
-    }
+    char date[24]; getDateStr(date, sizeof(date));
+    const SensorConfig& cfg = exp.sensor_cfg;
+    const CalibrationData& cal = exp.calibration;
 
+    f.print(exp.uuid);          f.print(',');
+    f.print(exp.experiment_id); f.print(',');
+    f.print(date);              f.print(',');
+    f.print((int)cfg.gain);     f.print(',');     // numeric gain — eases reimport
+    f.print(cfg.integrationCycles); f.print(',');
+    f.print(cfg.ledWhiteCurrent);   f.print(',');
+    f.print(cfg.ledWhiteEnabled ? "ON" : "OFF"); f.print(',');
+    f.print(cfg.ledIrCurrent);      f.print(',');
+    f.print(cfg.ledIrEnabled    ? "ON" : "OFF"); f.print(',');
+    f.print(cfg.ledUvCurrent);      f.print(',');
+    f.print(cfg.ledUvEnabled    ? "ON" : "OFF"); f.print(',');
+    f.print((int)cal.n_used);   f.print(',');
+    f.print(cal.valid ? 1 : 0);
+
+    for (int j = 0; j < NUM_CHANNELS; j++) {
+        f.print(',');
+        f.print(cal.valid ? cal.reference[j] : 0.0f, 4);
+    }
+    f.println();
     f.close();
-    Serial.println("[SD] Calibration saved");
+    Serial.printf("[SD] Calibration row appended for uuid=%s\n", exp.uuid);
     return true;
 }
 
@@ -187,19 +294,23 @@ bool SDLogger::saveCalibration(const CalibrationData& cal) {
 // Flag file format:  {"exp_id":"EXP_001","expected_rows":5,"saved_at_ms":1234}
 // ─────────────────────────────────────────────────────────────────────────────
 
-static String pendingPath(const char* expId) {
+static String pendingPath(const char* uuid) {
     String p = PENDING_DIR;
     p += "/";
-    p += expId;
+    p += uuid;
     p += ".json";
     return p;
 }
 
-bool SDLogger::markPending(const char* expId, int expectedRows) {
+bool SDLogger::markPending(const char* uuid, const char* expId, int expectedRows) {
     if (!_ready) return false;
+    if (!uuid || !*uuid) {
+        Serial.println("[SD] markPending: empty uuid — refusing");
+        return false;
+    }
     if (!SD.exists(PENDING_DIR)) SD.mkdir(PENDING_DIR);
 
-    String path = pendingPath(expId);
+    String path = pendingPath(uuid);
     if (SD.exists(path)) SD.remove(path);
 
     File f = SD.open(path, FILE_WRITE);
@@ -208,46 +319,52 @@ bool SDLogger::markPending(const char* expId, int expectedRows) {
         return false;
     }
 
-    StaticJsonDocument<192> doc;
-    doc["exp_id"] = expId;
+    StaticJsonDocument<256> doc;
+    doc["uuid"]          = uuid;
+    doc["exp_id"]        = expId ? expId : "";
     doc["expected_rows"] = expectedRows;
-    doc["saved_at_ms"] = (uint32_t)millis();
+    doc["saved_at_ms"]   = (uint32_t)millis();
     serializeJson(doc, f);
     f.close();
-    Serial.printf("[SD] Pending flag written: %s (N=%d)\n", expId, expectedRows);
+    Serial.printf("[SD] Pending flag written: %s (label='%s', N=%d)\n",
+                  uuid, expId ? expId : "", expectedRows);
     return true;
 }
 
-bool SDLogger::clearPending(const char* expId) {
+bool SDLogger::clearPending(const char* uuid) {
     if (!_ready) return false;
-    String path = pendingPath(expId);
+    String path = pendingPath(uuid);
     if (!SD.exists(path)) return true;
     bool ok = SD.remove(path);
-    if (ok) Serial.printf("[SD] Pending flag cleared: %s\n", expId);
+    if (ok) Serial.printf("[SD] Pending flag cleared: %s\n", uuid);
     return ok;
 }
 
-bool SDLogger::readPendingFile(const char* path, char* expIdOut, size_t expIdLen, int* expectedOut) {
+bool SDLogger::readPendingFile(const char* path,
+                               char* uuidOut, size_t uuidLen,
+                               char* expIdOut, size_t expIdLen,
+                               int* expectedOut) {
     File f = SD.open(path, FILE_READ);
     if (!f) return false;
-    StaticJsonDocument<192> doc;
+    StaticJsonDocument<256> doc;
     DeserializationError err = deserializeJson(doc, f);
     f.close();
     if (err) {
         Serial.printf("[SD] Corrupt pending flag: %s (%s)\n", path, err.c_str());
         return false;
     }
-    const char* id = doc["exp_id"] | "";
-    if (strlen(id) == 0) return false;
-    strncpy(expIdOut, id, expIdLen - 1);
-    expIdOut[expIdLen - 1] = 0;
+    const char* uid   = doc["uuid"]   | "";
+    const char* label = doc["exp_id"] | "";
+    if (strlen(uid) == 0) return false;       // uuid is the primary key
+    strncpy(uuidOut,  uid,   uuidLen  - 1); uuidOut[uuidLen  - 1] = 0;
+    strncpy(expIdOut, label, expIdLen - 1); expIdOut[expIdLen - 1] = 0;
     *expectedOut = doc["expected_rows"] | 0;
     return true;
 }
 
 // ─── HTTP verification ───────────────────────────────────────────────────────
 
-bool SDLogger::verifyWithServer(const char* expId, int expectedRows,
+bool SDLogger::verifyWithServer(const char* uuid, int expectedRows,
                                 const char* host, uint16_t port) {
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("[SD/verify] WiFi not connected");
@@ -258,8 +375,8 @@ bool SDLogger::verifyWithServer(const char* expId, int expectedRows,
     url += host;
     url += ":";
     url += port;
-    url += "/verify?exp_id=";
-    url += expId;
+    url += "/verify?uuid=";
+    url += uuid;
     url += "&expected=";
     url += expectedRows;
 
@@ -278,7 +395,7 @@ bool SDLogger::verifyWithServer(const char* expId, int expectedRows,
 
             StaticJsonDocument<256> doc;
             if (deserializeJson(doc, body)) {
-                Serial.printf("[SD/verify] Bad JSON for %s: %s\n", expId, body.c_str());
+                Serial.printf("[SD/verify] Bad JSON for %s: %s\n", uuid, body.c_str());
                 delay(500);
                 continue;
             }
@@ -286,11 +403,11 @@ bool SDLogger::verifyWithServer(const char* expId, int expectedRows,
             int found = doc["rows_found"] | 0;
             int expected = doc["rows_expected"] | 0;
             Serial.printf("[SD/verify] %s: verified=%d found=%d/%d\n",
-                          expId, verified ? 1 : 0, found, expected);
+                          uuid, verified ? 1 : 0, found, expected);
             return verified;
         } else {
             Serial.printf("[SD/verify] HTTP %d on attempt %d for %s\n",
-                          code, attempt, expId);
+                          code, attempt, uuid);
             http.end();
             delay(500);
         }
@@ -305,81 +422,58 @@ bool SDLogger::verifyWithServer(const char* expId, int expectedRows,
 // removed and the original file is untouched — NEVER data-lossy.
 // ─────────────────────────────────────────────────────────────────────────────
 
-bool SDLogger::removeExperimentRows(const char* expId) {
-    if (!_ready) return false;
-    if (!SD.exists(LOG_FILE)) return true;
-
-    const char* tmpPath = "/spectra.tmp";
+// Helper: rewrite `srcPath` keeping only rows whose first column does NOT
+// match `match`.  Returns true on success (including the no-op case).  Both
+// /spectra.csv and /calibrations.csv key uuid in column 0, so the same
+// implementation handles both files.
+static bool rewriteFilteredByCol0(const char* srcPath, const char* tmpPath,
+                                  const char* match) {
+    if (!SD.exists(srcPath)) return true;
     if (SD.exists(tmpPath)) SD.remove(tmpPath);
 
-    File in = SD.open(LOG_FILE, FILE_READ);
-    if (!in) {
-        Serial.println("[SD/remove] Cannot open source log");
-        return false;
-    }
+    File in = SD.open(srcPath, FILE_READ);
+    if (!in) return false;
     File out = SD.open(tmpPath, FILE_WRITE);
-    if (!out) {
-        in.close();
-        Serial.println("[SD/remove] Cannot create tmp log");
-        return false;
-    }
+    if (!out) { in.close(); return false; }
 
-    // Header: copy verbatim
     String header = in.readStringUntil('\n');
-    if (header.length() > 0) {
-        out.print(header);
-        out.print('\n');
-    }
+    if (header.length() > 0) { out.print(header); out.print('\n'); }
 
-    const size_t idLen = strlen(expId);
+    const size_t mLen = strlen(match);
     int kept = 0, dropped = 0;
-
     while (in.available()) {
         String line = in.readStringUntil('\n');
         if (line.length() == 0) continue;
-
-        // exp_id is the 2nd column (index 1). Find first comma, then scan
-        // the next column up to the second comma.
         int firstComma = line.indexOf(',');
         if (firstComma < 0) { out.print(line); out.print('\n'); kept++; continue; }
-        int secondComma = line.indexOf(',', firstComma + 1);
-        if (secondComma < 0) { out.print(line); out.print('\n'); kept++; continue; }
-
-        // Compare without allocating a substring
-        bool match = ((size_t)(secondComma - firstComma - 1) == idLen) &&
-                     (memcmp(line.c_str() + firstComma + 1, expId, idLen) == 0);
-
-        if (match) {
-            dropped++;
-        } else {
-            out.print(line);
-            out.print('\n');
-            kept++;
-        }
+        bool drop = ((size_t)firstComma == mLen) &&
+                    (memcmp(line.c_str(), match, mLen) == 0);
+        if (drop) { dropped++; continue; }
+        out.print(line); out.print('\n'); kept++;
     }
+    in.close(); out.flush(); out.close();
 
-    in.close();
-    out.flush();
-    out.close();
-
-    if (dropped == 0) {
-        // Nothing to do; discard tmp to avoid touching the source file
-        SD.remove(tmpPath);
-        Serial.printf("[SD/remove] No rows for %s — unchanged\n", expId);
-        return true;
-    }
-
-    // Atomic swap: remove original, rename tmp.
-    if (!SD.remove(LOG_FILE)) {
-        Serial.println("[SD/remove] Cannot remove original; keeping tmp for retry");
-        return false;
-    }
-    if (!SD.rename(tmpPath, LOG_FILE)) {
-        Serial.println("[SD/remove] Rename failed — data may be in tmp");
-        return false;
-    }
-    Serial.printf("[SD/remove] %s: dropped %d rows, kept %d\n", expId, dropped, kept);
+    if (dropped == 0) { SD.remove(tmpPath); return true; }
+    if (!SD.remove(srcPath)) return false;
+    if (!SD.rename(tmpPath, srcPath)) return false;
+    Serial.printf("[SD/remove] %s -> dropped=%d kept=%d (match=%s)\n",
+                  srcPath, dropped, kept, match);
     return true;
+}
+
+bool SDLogger::removeExperimentRows(const char* uuid) {
+    if (!_ready) return false;
+    bool a = rewriteFilteredByCol0(LOG_FILE, "/spectra.tmp", uuid);
+    // Always also strip the matching calibration row — orphan calibrations
+    // would survive forever otherwise (the UUID for that experiment is
+    // already gone from the DB by the time we run).
+    bool b = removeCalibrationRow(uuid);
+    return a && b;
+}
+
+bool SDLogger::removeCalibrationRow(const char* uuid) {
+    if (!_ready) return false;
+    return rewriteFilteredByCol0(CAL_FILE, "/calibrations.tmp", uuid);
 }
 
 // ─── Cleanup pass ────────────────────────────────────────────────────────────
@@ -418,26 +512,25 @@ int SDLogger::cleanupVerifiedExperiments(const char* host, uint16_t port) {
 
         if (!base.endsWith(".json")) continue;
 
-        char expId[32] = {0};
+        char uuid[37]   = {0};
+        char expId[64]  = {0};
         int expected = 0;
-        if (!readPendingFile(fullPath.c_str(), expId, sizeof(expId), &expected)) continue;
-        if (expected <= 0 || strlen(expId) == 0) continue;
+        if (!readPendingFile(fullPath.c_str(),
+                             uuid, sizeof(uuid),
+                             expId, sizeof(expId),
+                             &expected)) continue;
+        if (expected <= 0 || strlen(uuid) == 0) continue;
 
-        if (!verifyWithServer(expId, expected, host, port)) {
-            // Not yet verified — keep the flag; next pass will retry
+        if (!verifyWithServer(uuid, expected, host, port)) continue; // retry next pass
+
+        if (!removeExperimentRows(uuid)) {
+            Serial.printf("[SD/cleanup] Verified but CSV rewrite failed: %s (label='%s')\n",
+                          uuid, expId);
             continue;
         }
 
-        if (!removeExperimentRows(expId)) {
-            Serial.printf("[SD/cleanup] Verified but CSV rewrite failed: %s\n", expId);
-            continue;  // Keep flag; retry next pass
-        }
-
-        if (!clearPending(expId)) {
-            Serial.printf("[SD/cleanup] Rows dropped but flag clear failed: %s\n", expId);
-            // Non-fatal — next pass finds flag, re-verifies (still true),
-            // re-runs removeExperimentRows (no-op since rows already gone),
-            // re-tries clearPending.
+        if (!clearPending(uuid)) {
+            Serial.printf("[SD/cleanup] Rows dropped but flag clear failed: %s\n", uuid);
         }
         cleaned++;
     }
@@ -446,5 +539,37 @@ int SDLogger::cleanupVerifiedExperiments(const char* host, uint16_t port) {
     if (cleaned > 0) {
         Serial.printf("[SD/cleanup] %d experiment(s) verified and purged\n", cleaned);
     }
+
+    // ── Final sweep: if no pending flags remain, every saved experiment is
+    // confirmed in the DB.  Wipe the CSV (and the pending dir for tidiness)
+    // so the uSD has no residual files — meeting the "clean uSD" guarantee.
+    // We rescan the directory rather than trust `cleaned`, because a previous
+    // pass may have already drained pending while leaving the CSV behind.
+    bool pendingEmpty = true;
+    File pdir = SD.open(PENDING_DIR);
+    if (pdir && pdir.isDirectory()) {
+        File f;
+        while ((f = pdir.openNextFile())) {
+            String n = f.name();
+            int sl = n.lastIndexOf('/');
+            String b = (sl >= 0) ? n.substring(sl + 1) : n;
+            f.close();
+            if (b.endsWith(".json")) { pendingEmpty = false; break; }
+        }
+        pdir.close();
+    }
+
+    if (pendingEmpty) {
+        if (SD.exists(LOG_FILE) && !SD.remove(LOG_FILE))
+            Serial.println("[SD/cleanup] WARNING: could not remove /spectra.csv");
+        if (SD.exists(CAL_FILE) && !SD.remove(CAL_FILE))
+            Serial.println("[SD/cleanup] WARNING: could not remove /calibrations.csv");
+        // Recreate empty schemas so the next saveExperiment has a target.
+        // Headers are NOT residual data — they are the file's contract.
+        ensureHeader();
+        ensureCalibrationsHeader();
+        Serial.println("[SD/cleanup] All experiments verified — SD wiped of data");
+    }
+
     return cleaned;
 }

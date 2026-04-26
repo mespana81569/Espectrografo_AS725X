@@ -1,10 +1,18 @@
 #pragma once
 
 // PubSubClient uses this to size its internal RX/TX buffer.
-// Must be defined BEFORE including PubSubClient.h anywhere in the translation
-// unit — one experiment payload can reach ~3.8 KB.
+// Must be defined BEFORE including PubSubClient.h anywhere in the TU.
+//
+// Sizing rationale:
+//   18 channels × ~12 chars/value × 20 measurements ≈ 4.3 KB just for the
+//   raw spectra array.  Adding the calibration block, sensor config,
+//   wavelengths and JSON scaffolding pushes a 20-meas experiment to ~6 KB.
+//   The previous 4096 limit silently dropped any experiment that overflowed
+//   it (PubSubClient::publish returns false, the upload state machine logged
+//   "FAIL" and moved on without retrying).  16 KB gives comfortable
+//   headroom and still costs <0.1% of the ESP32's heap.
 #ifndef MQTT_MAX_PACKET_SIZE
-#define MQTT_MAX_PACKET_SIZE 4096
+#define MQTT_MAX_PACKET_SIZE 16384
 #endif
 
 #include <Arduino.h>
@@ -31,10 +39,14 @@
 #define MQTT_TOPIC_CMD_PULL_DATA "esp32/cmd/pull_data"
 
 // Data (published) — ESP32 → control.html
-#define MQTT_TOPIC_DATA_STATE    "esp32/data/state"
-#define MQTT_TOPIC_DATA_SPECTRA  "esp32/data/spectra"
-#define MQTT_TOPIC_DATA_STATUS   "esp32/data/status"
-#define MQTT_TOPIC_DATA_UPLOAD   "esp32/data/upload"
+#define MQTT_TOPIC_DATA_STATE         "esp32/data/state"
+#define MQTT_TOPIC_DATA_SPECTRA       "esp32/data/spectra"
+#define MQTT_TOPIC_DATA_STATUS        "esp32/data/status"
+#define MQTT_TOPIC_DATA_UPLOAD        "esp32/data/upload"
+#define MQTT_TOPIC_DATA_CAL_PROGRESS  "esp32/data/cal_progress"
+#define MQTT_TOPIC_DATA_MEAS_PROGRESS "esp32/data/meas_progress"
+#define MQTT_TOPIC_DATA_MONITOR       "esp32/data/monitor"
+#define MQTT_TOPIC_DATA_PULL_ERROR    "esp32/data/upload/error"
 
 class MqttClient {
 public:
@@ -66,8 +78,9 @@ public:
     // Public only so file-local upload helpers in the .cpp can take it by
     // reference — not part of the stable API surface.
     struct UploadGroup {
-        char  exp_id[32];
-        int   gain_int;          // 0-3 decoded from "1x"/"4x"/"16x"/"64x"
+        char  uuid[37];          // primary key — see R1 in design doc
+        char  exp_id[64];        // user-facing label, may repeat across uuids
+        int   gain_int;          // numeric AS7265X gain (0..3)
         int   int_cycles;
         int   mode;              // CSV has no mode column; defaults to 3
         int   led_white_ma;
@@ -93,6 +106,14 @@ private:
     // Heartbeat cadence
     unsigned long _lastHeartbeat;
     static const unsigned long HEARTBEAT_INTERVAL_MS = 5000;
+
+    // Live frame cadence (clarification #3 — 500 ms starting point).
+    // Same throttle applies to cal_progress / meas_progress / monitor so a
+    // burst of state changes can never saturate the broker.
+    unsigned long _lastLiveFrame;
+    int           _lastCalK;        // last calibration sample count published
+    int           _lastMeasK;       // last measurement count published
+    static const unsigned long LIVE_INTERVAL_MS = 500;
 
     bool _wasConnected;  // edge-detect first successful connect
 
@@ -122,6 +143,15 @@ private:
     UploadState _uploadState;
     UploadGroup _group;
     bool        _uploadSucceeded;
+    // Per-group publish retry: if _client.publish() returns false (broker
+    // refused or socket transient), we keep _group buffered and retry on
+    // the next tick instead of silently moving on.  After UPLOAD_MAX_RETRIES
+    // failures we publish an error event for that uuid and skip ahead so
+    // a single bad payload never wedges the whole pull.
+    int         _groupRetries;
+    int         _uploadedOk;     // tally per pull session
+    int         _uploadedFail;
+    static const int UPLOAD_MAX_RETRIES = 3;
 
     // ─── Private helpers ──────────────────────────────────────────────────
     static MqttClient* _instance;
@@ -137,6 +167,11 @@ private:
 
     // Heartbeat publisher
     void publishHeartbeat();
+
+    // Live frame publishers — issue #7 root cause was these never existed.
+    // Called from tick() at LIVE_INTERVAL_MS cadence; each is a no-op when
+    // the corresponding state isn't active.
+    void publishLiveFrames();
 
     // Bulk upload driver — runs at most one "unit" of work per call
     void processUploadTick();

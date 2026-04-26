@@ -165,6 +165,14 @@
     <input type="number" id="intCycles" value="50" min="1" max="255"/>
     <label>Measurements (N, max 20)</label>
     <input type="number" id="measN" value="5" min="1" max="20"/>
+    <div class="row" style="margin-top:.4rem">
+      <input type="checkbox" id="nCalSameAsN" checked style="width:auto"/>
+      <label style="margin:0;display:inline" title="Recommended ON. When ON, the blank reference is averaged over N samples (the same as the measurement count). When OFF, set N_cal explicitly below.">
+        Use same N for calibration
+      </label>
+    </div>
+    <label id="nCalLabel">Calibration N (only used when toggle is OFF)</label>
+    <input type="number" id="nCal" value="5" min="1" max="20" disabled/>
     <h2 style="margin-top:.5rem">LED Bulbs</h2>
     <div class="row"><input type="checkbox" id="ledW" style="width:auto"><label style="margin:0;display:inline">White (VIS)</label>
       <select id="ledWmA" style="width:5rem;margin-left:auto"><option value="12" selected>12.5</option><option value="25">25</option><option value="50">50</option><option value="100">100</option></select><span style="font-size:.7rem;color:var(--muted)">mA</span></div>
@@ -199,13 +207,16 @@
         <button class="bA" onclick="loadExperiments(true)">Refresh</button>
         <button class="bA" id="pgPrev" onclick="pgMove(-1)">&laquo; Prev</button>
         <button class="bA" id="pgNext" onclick="pgMove(1)">Next &raquo;</button>
+        <button class="bR" onclick="bulkDelete()">Delete Selected</button>
+        <button class="bP" onclick="document.getElementById('importDlg').classList.remove('hidden')">Import from Computer</button>
         <span class="muted" id="pgInfo">&mdash;</span>
         <span id="expSpin" class="spin hidden"></span>
       </div>
       <div class="scroll">
         <table id="expTbl">
           <thead><tr>
-            <th>Exp ID</th><th>Date/Time</th><th>N</th><th>Gain</th><th>Int</th>
+            <th><input type="checkbox" id="expSelAll" onchange="toggleSelectAll(this.checked)"/></th>
+            <th>Exp ID</th><th>UUID</th><th>Date/Time</th><th>N</th><th>Gain</th><th>Int</th>
             <th>White mA</th><th>IR mA</th><th>UV mA</th><th>Cal</th><th></th>
           </tr></thead>
           <tbody></tbody>
@@ -214,25 +225,71 @@
     </div>
   </div>
 
+  <!-- Manual import wizard (issue #8.B + clarification #7) ───────────────
+       Calibration file FIRST (clarification #7), then measurements.  Both
+       must come from the device's SD layout so an offline pull is a
+       drop-in import. -->
+  <div id="importDlg" class="hidden" style="position:fixed;inset:0;background:rgba(0,0,0,.85);
+       z-index:200;display:flex;align-items:center;justify-content:center">
+    <div class="c" style="max-width:480px;width:90%">
+      <h2>Import Experiment from Computer</h2>
+      <p class="muted">Files must come from the device's SD card (calibrations.csv + spectra.csv).
+        Both must agree on the same uuid.  After insert the same post-processing runs as for a
+        live device upload.</p>
+      <label>1. Calibration file (calibrations.csv)</label>
+      <input type="file" id="impCal" accept=".csv,text/csv"/>
+      <label>2. Measurements file (spectra.csv)</label>
+      <input type="file" id="impMeas" accept=".csv,text/csv"/>
+      <div class="toolbar" style="margin-top:.6rem">
+        <button class="bG" onclick="runImport()">Import</button>
+        <button class="bR" onclick="document.getElementById('importDlg').classList.add('hidden')">Cancel</button>
+      </div>
+      <div id="impMsg" class="muted" style="margin-top:.5rem"></div>
+    </div>
+  </div>
+
   <div class="pane" id="pane_spv">
     <div class="c">
       <div class="toolbar">
         <label style="margin:0">Experiment:</label>
-        <select id="spvSel" style="min-width:180px"></select>
+        <select id="spvSel" style="min-width:240px"></select>
         <button class="bA" onclick="loadSpectra()">Load</button>
+        <button class="bR" onclick="deleteCurrentExperiment()">Delete this experiment</button>
         <span id="spvSpin" class="spin hidden"></span>
       </div>
-      <h2 style="margin:.4rem 0">Measurements &amp; Calibration</h2>
+
+      <!-- Per-experiment configuration table (issue #1) ──────────────── -->
+      <h2 style="margin:.4rem 0">Acquisition Configuration</h2>
+      <div class="scroll" style="max-height:none">
+        <table class="tblRaw" id="spvCfgTbl"><tbody></tbody></table>
+      </div>
+
+      <h2 style="margin:.6rem 0 .3rem">Transmittance &mdash; last 3 measurements</h2>
       <canvas id="spvChart" class="cvBig" height="320"></canvas>
       <div class="measCheckList" id="spvChecks"></div>
-      <p class="muted" style="margin:.3rem 0">Showing up to the last 3 measurements selected below. Dashed gray line = calibration offsets (blank reference).</p>
+      <p class="muted" style="margin:.3rem 0">X-axis = wavelength (nm); Y-axis = T(λ) = I/I&#8320; × 100 % (Beer–Lambert). Dashed grey = blank reference (T = 100 %).</p>
 
-      <h2 style="margin:.8rem 0 .4rem">Calibration vs Mean of Measurements</h2>
+      <!-- Absorbance plot (issue #5) — same channels, same colors as T plot -->
+      <h2 style="margin:.6rem 0 .3rem">Absorbance &mdash; last 3 measurements</h2>
+      <canvas id="spvAbsChart" class="cvBig" height="320"></canvas>
+      <p class="muted" style="margin:.3rem 0">Y-axis = A(λ) = −log₁₀(T). Persisted in the DB as it was computed by the ESP32 — not recomputed in the browser.</p>
+
+      <h2 style="margin:.8rem 0 .4rem">Calibration vs Mean of Measurements (T %)</h2>
       <canvas id="spvMeanChart" class="cvBig" height="280"></canvas>
-      <p class="muted" style="margin:.3rem 0">Per-channel mean of all measurements in this experiment, overlaid on the calibration offsets.</p>
+      <p class="muted" style="margin:.3rem 0">Per-channel mean of all transmittance rows for this experiment, overlaid on the blank reference (T = 100 %).</p>
+
       <div class="scroll" style="margin-top:.5rem">
         <table class="tblRaw" id="spvTbl">
           <thead><tr id="spvHead"></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <!-- Per-experiment absorbance table (issue #5) ─────────────────── -->
+      <h2 style="margin:.6rem 0 .3rem">Absorbance values (a.u.)</h2>
+      <div class="scroll">
+        <table class="tblRaw" id="spvAbsTbl">
+          <thead><tr id="spvAbsHead"></tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -275,6 +332,14 @@ var reconnectTimer = null;
 var espSeen = false;
 var espLastSeenMs = 0;
 var ESP_TIMEOUT_MS = 15000;
+
+// In-flight experiment buffer for issue #7 — driven by meas_progress events,
+// keyed by uuid so rows from a previous run can never leak into the current.
+var liveExp = {uuid:null, exp_id:null, rows:[], offsets:null, count:0};
+// Most recent calibration from the device (offsets only).  Captured from
+// the next esp32/data/spectra publish; until we have one the live chart
+// renders without an overlay.
+var lastCal = null;
 
 function lg(m){
   var el=document.getElementById('log');
@@ -360,18 +425,27 @@ function onMqttMessage(m){
   try{ data = JSON.parse(pl); }catch(e){}
 
   if(topic === 'esp32/data/state'){
-    if(data && data.state){
-      cur = data.state;
-      lastStatus = Object.assign(lastStatus||{}, data);
+    // The state topic carries either a JSON object (data.state set) or a
+    // bare string ("IDLE", "MEASUREMENT", etc.) — publishState in the
+    // firmware uses the bare-string form.  Handle both so the post-save
+    // applyCfg latch always fires regardless of payload shape.
+    var raw = (data && data.state) ? data.state : (typeof pl === 'string' ? pl : '');
+    if(raw){
+      cur = raw;
+      if(data) lastStatus = Object.assign(lastStatus||{}, data);
       updPipe(cur);
       updBtns(cur);
       updStateBadge(cur);
       updStatusCards(lastStatus);
+      maybeFireApplyAfterSave(cur);
     }
   } else if(topic === 'esp32/data/status'){
     if(data){
       lastStatus = Object.assign(lastStatus||{}, data);
-      if(data.state){ cur=data.state; updPipe(cur); updBtns(cur); updStateBadge(cur); }
+      if(data.state){
+        cur=data.state; updPipe(cur); updBtns(cur); updStateBadge(cur);
+        maybeFireApplyAfterSave(cur);
+      }
       document.getElementById('espDot').className='d ok';
       document.getElementById('espTxt').textContent=new Date().toLocaleTimeString();
       espSeen = true;
@@ -383,7 +457,14 @@ function onMqttMessage(m){
     }
   } else if(topic === 'esp32/data/spectra'){
     if(data && data.spectra){
+      // Cache the calibration so the in-flight live chart (driven by
+      // meas_progress) can overlay the blank reference even before the next
+      // experiment finishes.
+      if(data.calibration) lastCal = data.calibration;
       drawChart(data);
+      // Final-publish reset of the in-flight buffer — start clean for the
+      // next experiment.
+      liveExp = {uuid:null, exp_id:null, rows:[], offsets:null, count:0};
       setTimeout(function(){ loadExperiments(false); }, 800);
     }
   } else if(topic === 'esp32/data/upload'){
@@ -393,6 +474,78 @@ function onMqttMessage(m){
     setTimeout(function(){ loadExperiments(false); }, 500);
   } else if(topic === 'esp32/data/monitor'){
     if(data) drawLive(data);
+  } else if(topic === 'esp32/data/cal_progress'){
+    if(data){
+      // Reuse the existing #prog/#progL bar — we just feed it cal counts
+      // while in CALIBRATION state.  Switching back to measCount is handled
+      // by updStatusCards() on the next status frame.
+      var pct = data.n>0 ? Math.min(100, data.k/data.n*100) : 0;
+      document.getElementById('prog').style.width=pct+'%';
+      document.getElementById('progL').textContent='Cal '+data.k+' / '+data.n;
+    }
+  } else if(topic === 'esp32/data/meas_progress'){
+    if(data){
+      var pct = data.n>0 ? Math.min(100, data.k/data.n*100) : 0;
+      document.getElementById('prog').style.width=pct+'%';
+      document.getElementById('progL').textContent='Meas '+data.k+' / '+data.n;
+      // Roll the in-flight row into a per-experiment buffer keyed by uuid
+      // so the Last Measurements plot updates incrementally — issue #7.
+      if(data.row && data.uuid){
+        if(!liveExp.uuid || liveExp.uuid!==data.uuid){
+          liveExp = {uuid:data.uuid, exp_id:data.exp_id, rows:[], offsets:null, count:0};
+        }
+        liveExp.rows.push(data.row);
+        liveExp.count = data.k;
+        // We don't have offsets in the live frame; use the most recent
+        // status-supplied calibration if present.  Falls back to no overlay.
+        drawChart({
+          spectra: liveExp.rows,
+          wavelengths: WAVELENGTHS,
+          count: data.k,
+          calibration: lastCal
+        });
+      }
+    }
+  } else if(topic === 'esp32/data/upload/error'){
+    if(data){
+      var who = data.exp_id ? (data.exp_id+' ['+(data.requested||'').slice(0,8)+']') : (data.requested||'?');
+      var why = data.reason || 'unknown';
+      if(data.bytes && data.buffer) why += ' ('+data.bytes+'B vs '+data.buffer+'B buffer)';
+      var msg='Pull failed for '+who+' — '+why;
+      lg(msg);
+      try{
+        var b=document.getElementById('banner');
+        b.classList.remove('hidden');
+        b.textContent=msg;
+      }catch(e){}
+    }
+  } else if(topic === 'esp32/data/upload/progress'){
+    // Per-experiment ack from the device during a bulk pull.  Update the
+    // progress bar and log the success — gives the user something to watch
+    // while a long pull runs and immediately exposes failures.
+    if(data){
+      var ok=data.ok||0, fail=data.fail||0;
+      lg('Pulled '+ok+' ok'+(fail?(' / '+fail+' failed'):'')+' — last: '+(data.exp_id||'?'));
+      try{
+        document.getElementById('progL').textContent='Pull '+ok+' ok / '+fail+' fail';
+      }catch(e){}
+    }
+  } else if(topic === 'esp32/data/upload/done'){
+    if(data){
+      var msg='Pull finished: '+(data.ok||0)+' ok, '+(data.fail||0)+' failed';
+      lg(msg);
+      try{
+        var b=document.getElementById('banner');
+        if((data.fail||0) > 0){
+          b.classList.remove('hidden');
+          b.textContent=msg+' — failed experiments will retry on the next pull.';
+        } else {
+          b.classList.add('hidden');
+        }
+      }catch(e){}
+      // Refresh the experiments list so newly-uploaded ones appear.
+      setTimeout(function(){ loadExperiments(true); }, 600);
+    }
   } else {
     if(topic.indexOf('esp32/data/')===0){
       var sub=topic.substr(11);
@@ -454,6 +607,40 @@ function updBtns(s){
   document.getElementById('liveCard').classList.toggle('hidden',!live);
 }
 
+// When the user presses Save we (a) tell the device, (b) auto-increment the
+// label locally, then (c) push the new config to the device.  Step (c) MUST
+// wait until the device has finished the SAVE_DECISION → IDLE transition,
+// otherwise handleSetConfig rejects with "Config only allowed in IDLE state"
+// and the device keeps the OLD label for every subsequent acquisition.  The
+// previous setTimeout(applyCfg, 50) was a guess that lost the race whenever
+// the SD write took longer than 50 ms (often).  We now arm a one-shot flag
+// and let the existing state subscription fire applyCfg() the moment we
+// observe IDLE.  Falls back to a 5 s safety timer in case the state event
+// never arrives (broker hiccup).
+var pendingApplyAfterSave = false;
+var pendingApplyTimer = null;
+function armApplyAfterSave(){
+  pendingApplyAfterSave = true;
+  if(pendingApplyTimer) clearTimeout(pendingApplyTimer);
+  pendingApplyTimer = setTimeout(function(){
+    if(pendingApplyAfterSave){
+      lg('applyCfg fallback fired (no IDLE seen in 5s)');
+      pendingApplyAfterSave = false;
+      applyCfg();
+    }
+  }, 5000);
+}
+function maybeFireApplyAfterSave(state){
+  if(state === 'IDLE' && pendingApplyAfterSave){
+    pendingApplyAfterSave = false;
+    if(pendingApplyTimer){ clearTimeout(pendingApplyTimer); pendingApplyTimer = null; }
+    // Tiny delay so the device has a moment to settle SD/state writes after
+    // entering IDLE — without it the very-fast state event can sometimes
+    // beat the actual transition completion in the firmware.
+    setTimeout(applyCfg, 30);
+  }
+}
+
 function act(a){
   pubCmd('esp32/cmd/'+a, '');
   lg('> '+a);
@@ -471,10 +658,12 @@ function act(a){
       el.value=v+'_2';
     }
     lg('Next experiment: '+el.value);
+    armApplyAfterSave();   // applyCfg() runs as soon as the device reports IDLE
   }
 }
 
 function applyCfg(){
+  var sameAsN = document.getElementById('nCalSameAsN').checked;
   var cfg={
     gain:parseInt(document.getElementById('gain').value),
     integrationCycles:parseInt(document.getElementById('intCycles').value),
@@ -486,11 +675,23 @@ function applyCfg(){
     ledIrEnabled:document.getElementById('ledI').checked,
     ledUvEnabled:document.getElementById('ledU').checked,
     N:parseInt(document.getElementById('measN').value),
+    nCal:parseInt(document.getElementById('nCal').value)||5,
+    nCalUseSameAsN:sameAsN,
     expId:document.getElementById('expId').value.trim()||'EXP_001'
   };
   pubCmd('esp32/cmd/config', JSON.stringify(cfg));
   lg('> config applied');
 }
+// nCal field is only relevant when the toggle is OFF.
+document.addEventListener('DOMContentLoaded', function(){
+  var cb=document.getElementById('nCalSameAsN');
+  var nc=document.getElementById('nCal');
+  if(cb && nc){
+    var sync=function(){ nc.disabled = cb.checked; };
+    cb.addEventListener('change', sync);
+    sync();
+  }
+});
 
 function monStart(){ pubCmd('esp32/cmd/monitor/start',''); lg('> monitor start'); }
 function monStop(){ pubCmd('esp32/cmd/monitor/stop',''); lg('> monitor stop'); }
@@ -499,6 +700,47 @@ function pullData(){
   if(!espSeen){ lg('Pull Data: ESP32 not detected'); return; }
   pubCmd('esp32/cmd/pull_data','');
   lg('> pull_data requested');
+}
+
+/* ─── Y-axis physics (Beer–Lambert spectroscopy) ────────────────────────────
+   The AS7265X channel value is a unit-less integer photon "count" that scales
+   with gain × integration time and is not comparable across runs without a
+   reference.  The reference is the BLANK measurement I0 = `offsets[i]`.
+   The stored measurement value is the SIGNED differential
+
+       Δ(λᵢ) = I(λᵢ) − I0(λᵢ)        [counts]
+
+   so the viewer can recover the sample intensity I = Δ + I0 and compute
+   transmittance and absorbance:
+
+       T(λ)   = I / I0                 [dimensionless, 0..~1]
+       T_pct  = T · 100                [%]
+       A(λ)   = −log10(T)              [dimensionless absorbance]
+
+   Beer–Lambert (the governing law):  A(λ) = ε(λ) · c · ℓ
+   where ε is molar absorptivity, c concentration, ℓ optical path length.
+
+   Step-by-step Y-axis validation:
+     1. Sensor → counts (unit: counts; gain & int-time dependent).
+     2. Subtract I0 in firmware → Δ (counts, signed).
+     3. Recover I = Δ + I0 here  (counts, ≥ 0).
+     4. Divide I / I0            (dimensionless).
+     5. Multiply by 100          (percent — what we plot).
+
+   If `offsets` is missing or any I0 ≤ 0 we cannot compute T and we plot the
+   raw Δ counts, labelling the axis "Counts (uncalibrated)".
+   ─────────────────────────────────────────────────────────────────────────── */
+function deltasToTransmittancePct(delta, offsets){
+  if(!offsets || !offsets.length || offsets.length!==delta.length) return null;
+  var out=new Array(delta.length);
+  for(var i=0;i<delta.length;i++){
+    var I0=+offsets[i];
+    if(!isFinite(I0) || I0<=0) return null;     // can't divide; abort row
+    var I = (+delta[i]) + I0;                   // recover sample intensity
+    if(I<0) I=0;                                // physical floor
+    out[i] = (I / I0) * 100.0;                  // transmittance, percent
+  }
+  return out;
 }
 
 /* chart drawing â€” mirrors html_content.h */
@@ -522,13 +764,39 @@ function drawChartOn(cvId, spectra, wavelengths, labels, offsets, opts){
   if(!spectra || !spectra.length || !wavelengths || !wavelengths.length) return;
 
   var xLabel = (opts && opts.xLabel) || 'Wavelength (nm)';
-  var yLabel = (opts && opts.yLabel) || 'Transmittance';
-  var offsetsLabel = (opts && opts.offsetsLabel) || 'Cal offset';
+  // When the caller supplies `offsets` we treat `spectra` as the SIGNED Δ
+  // (= sample − blank counts) and convert each row to transmittance percent
+  // via Beer–Lambert (see deltasToTransmittancePct above). Without offsets we
+  // just plot the values as they came in.
+  var canT = !!(offsets && offsets.length===wavelengths.length);
+  var converted = spectra;
+  if(canT){
+    converted = [];
+    for(var i=0;i<spectra.length;i++){
+      var t = deltasToTransmittancePct(spectra[i], offsets);
+      if(!t){ canT=false; converted = spectra; break; }
+      converted.push(t);
+    }
+  }
+  var yLabel = (opts && opts.yLabel) || (canT ? 'Transmittance (%)' : 'Counts (uncalibrated)');
+  var offsetsLabel = (opts && opts.offsetsLabel) || (canT ? 'I₀ ≡ 100 % (blank ref.)' : 'Cal offset');
 
-  var mx=0;
-  for(var i=0;i<spectra.length;i++) for(var j=0;j<spectra[i].length;j++) if(spectra[i][j]>mx) mx=spectra[i][j];
-  if(offsets) for(var j=0;j<offsets.length;j++) if(offsets[j]>mx) mx=offsets[j];
-  if(mx===0) mx=1;
+  // For T% the natural axis is fixed 0..100 — comparable across measurements.
+  // For raw counts we auto-scale to the data.  The caller may also force a
+  // fixed yMax (e.g. for stored T% rows where canT detection is skipped).
+  var mx;
+  if(opts && typeof opts.yMax==='number'){
+    mx = opts.yMax;
+  } else if(canT){
+    mx = 100;
+  } else {
+    mx=0;
+    for(var i=0;i<converted.length;i++) for(var j=0;j<converted[i].length;j++) if(converted[i][j]>mx) mx=converted[i][j];
+    if(offsets) for(var j=0;j<offsets.length;j++) if(offsets[j]>mx) mx=offsets[j];
+    if(mx===0) mx=1;
+  }
+  // From here on, render `converted` (T% if calValid, Δ otherwise).
+  spectra = converted;
 
   var L=56,R=12,T=18,B=42;
   var pW=W-L-R, pH=H-T-B;
@@ -547,7 +815,7 @@ function drawChartOn(cvId, spectra, wavelengths, labels, offsets, opts){
   ctx.textAlign='right';
   for(var i=0;i<=4;i++){
     var y=T+pH*(1-i/4);
-    ctx.fillText((mx*i/4).toFixed(1),L-4,y+3);
+    ctx.fillText((mx*i/4).toFixed(canT?0:1),L-4,y+3);
   }
   // Axis titles
   ctx.fillStyle='#e2e8f0'; ctx.font='11px sans-serif';
@@ -584,11 +852,15 @@ function drawChartOn(cvId, spectra, wavelengths, labels, offsets, opts){
   }
 
   if(offsets && offsets.length){
+    // When plotting T%, the blank reference IS the 100% line by definition
+    // (T₀ = I₀ / I₀ = 1 → 100 %).  Draw it as a flat reference.
+    // When plotting raw counts, draw the actual offset values.
     ctx.strokeStyle='#94a3b8'; ctx.lineWidth=1.4;
     ctx.setLineDash([5,4]); ctx.beginPath();
     for(var i=0;i<offsets.length;i++){
       var x=L+(i/(offsets.length-1))*pW;
-      var y=T+pH*(1-offsets[i]/mx);
+      var v=canT?100:offsets[i];
+      var y=T+pH*(1-v/mx);
       if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
     }
     ctx.stroke(); ctx.setLineDash([]);
@@ -617,8 +889,11 @@ function drawChart(data){
   var wl=data.wavelengths||WAVELENGTHS;
   var base=(data.count||sp.length)-sp.length;
   var labels=[]; for(var i=0;i<sp.length;i++) labels.push('Meas '+(base+i+1));
-  drawChartOn('chart', sp, wl, labels, null,
-              {xLabel:'Wavelength (nm)', yLabel:'Transmittance'});
+  // Pass calibration offsets (I0) when valid so the chart can compute T%.
+  var offs = (data.calibration && data.calibration.valid && data.calibration.offsets &&
+              data.calibration.offsets.length===wl.length) ? data.calibration.offsets : null;
+  drawChartOn('chart', sp, wl, labels, offs,
+              {xLabel:'Wavelength (nm)'});
 }
 
 function wlClr(nm){
@@ -690,7 +965,11 @@ function showTab(id){
   if(id==='exp') maybeRefresh('exp', loadExperiments);
   if(id==='spv'){
     maybeRefresh('spv', populateExpSelect);
-    if(cache.spv.data) requestAnimationFrame(redrawSpv);
+    // Only repaint cached spectra if they still match the current dropdown
+    // selection (which is now keyed by uuid) — otherwise the user would
+    // briefly see the previous experiment's data when re-opening the tab.
+    var sel = document.getElementById('spvSel').value;
+    if(cache.spv.data && cache.spv.uuid === sel) requestAnimationFrame(redrawSpv);
   }
   if(id==='exp2') maybeRefresh('exp2', populateExpSelect);
 }
@@ -733,30 +1012,94 @@ function renderExperiments(rows){
   var tb=document.querySelector('#expTbl tbody');
   tb.innerHTML='';
   if(!rows.length){
-    tb.innerHTML='<tr><td colspan="10" class="muted" style="text-align:center">No experiments yet.</td></tr>';
+    tb.innerHTML='<tr><td colspan="12" class="muted" style="text-align:center">No experiments yet.</td></tr>';
     return;
   }
   for(var i=0;i<rows.length;i++){
     var r=rows[i];
     var tr=document.createElement('tr');
-    var dt=r.timestamp_ms?new Date(r.timestamp_ms).toLocaleString():'â€”';
+    var dt=r.timestamp_ms?new Date(r.timestamp_ms).toLocaleString():(r.created_at||'—');
+    var uuidShort = r.uuid ? esc(String(r.uuid).slice(0,8)) : '—';
     tr.innerHTML =
+      '<td><input type="checkbox" class="expSelChk" data-uuid="'+esc(r.uuid)+'"/></td>'+
       '<td>'+esc(r.exp_id)+'</td>'+
+      '<td title="'+esc(r.uuid)+'"><code style="font-size:.6rem">'+uuidShort+'</code></td>'+
       '<td>'+esc(dt)+'</td>'+
       '<td>'+r.num_measurements+'</td>'+
       '<td>'+gainLabel(r.gain)+'</td>'+
       '<td>'+r.int_cycles+'</td>'+
-      '<td>'+r.led_white_ma+'</td>'+
-      '<td>'+r.led_ir_ma+'</td>'+
-      '<td>'+r.led_uv_ma+'</td>'+
+      '<td>'+r.led_white_ma+(r.led_white_on?'*':'')+'</td>'+
+      '<td>'+r.led_ir_ma   +(r.led_ir_on   ?'*':'')+'</td>'+
+      '<td>'+r.led_uv_ma   +(r.led_uv_on   ?'*':'')+'</td>'+
       '<td><span class="pill '+(r.cal_valid?'ok':'er')+'">'+(r.cal_valid?'valid':'no')+'</span></td>'+
-      '<td><button class="bA" style="width:auto;padding:.2rem .5rem;font-size:.68rem;margin:0" '+
-      'onclick="viewSpectra(\''+esc(r.exp_id)+'\')">View Spectra</button></td>';
+      '<td>'+
+        '<button class="bA" style="width:auto;padding:.2rem .5rem;font-size:.68rem;margin:0" '+
+        'onclick="viewSpectra(\''+esc(r.uuid)+'\')">View</button> '+
+        '<button class="bR" style="width:auto;padding:.2rem .5rem;font-size:.68rem;margin:0" '+
+        'onclick="deleteOne(\''+esc(r.uuid)+'\',\''+esc(r.exp_id)+'\')">×</button>'+
+      '</td>';
     tb.appendChild(tr);
   }
 }
 
 function gainLabel(g){ return ['1x','4x','16x','64x'][g]||g; }
+
+function toggleSelectAll(on){
+  var ck=document.querySelectorAll('.expSelChk');
+  for(var i=0;i<ck.length;i++) ck[i].checked = on;
+}
+
+function deleteOne(uuid, label){
+  if(!uuid) return;
+  if(!confirm('Delete experiment "'+label+'" ('+uuid.slice(0,8)+')?\n\nThis removes its measurements, calibration, transmittance and absorbance rows from the database.')) return;
+  fetch('/experiments/'+encodeURIComponent(uuid), {method:'DELETE'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      lg('Deleted '+(j.deleted||0)+' row(s) for '+uuid.slice(0,8));
+      loadExperiments(true);
+    })
+    .catch(function(e){ lg('delete err: '+e.message); });
+}
+
+function bulkDelete(){
+  var ck=document.querySelectorAll('.expSelChk:checked');
+  if(!ck.length){ alert('No experiments selected.'); return; }
+  var uuids=[]; for(var i=0;i<ck.length;i++) uuids.push(ck[i].dataset.uuid);
+  if(!confirm('Delete '+uuids.length+' experiment(s)?\n\n'+uuids.map(function(u){return u.slice(0,8);}).join(', '))) return;
+  Promise.all(uuids.map(function(u){
+    return fetch('/experiments/'+encodeURIComponent(u), {method:'DELETE'}).then(function(r){return r.json();});
+  })).then(function(results){
+    var n=0; for(var i=0;i<results.length;i++) n += (results[i].deleted||0);
+    lg('Bulk delete: '+n+' row(s) removed');
+    loadExperiments(true);
+  });
+}
+
+function runImport(){
+  var cal = document.getElementById('impCal').files[0];
+  var meas= document.getElementById('impMeas').files[0];
+  var msg = document.getElementById('impMsg');
+  if(!cal || !meas){ msg.textContent='Both files required (calibration + measurements).'; return; }
+  // Clarification #7 — calibration FIRST.  The form field order matches.
+  var fd = new FormData();
+  fd.append('calibration',  cal);
+  fd.append('measurements', meas);
+  msg.textContent='Uploading...';
+  fetch('/experiments/import', {method:'POST', body:fd})
+    .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
+    .then(function(o){
+      if(!o.ok){ msg.textContent='Import failed: '+(o.j.error||'unknown'); return; }
+      msg.textContent='Imported '+(o.j.imported||'').slice(0,8)+' ('+o.j.rows+' rows)';
+      loadExperiments(true);
+      setTimeout(function(){ document.getElementById('importDlg').classList.add('hidden'); }, 1500);
+    })
+    .catch(function(e){ msg.textContent='Import err: '+e.message; });
+}
+
+function deleteCurrentExperiment(){
+  var data = cache.spv.data; if(!data || !data.uuid){ alert('No experiment loaded.'); return; }
+  deleteOne(data.uuid, data.exp_id || '');
+}
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){return'&#'+c.charCodeAt(0)+';';}); }
 
 function populateExpSelect(list){
@@ -767,29 +1110,57 @@ function populateExpSelect(list){
     });
     return;
   }
+  // Preserve the user's current selection across re-populates — otherwise the
+  // periodic refresh wipes it and the chart gets out of sync with the dropdown.
+  var spv = document.getElementById('spvSel');
+  var ex  = document.getElementById('exSel');
+  var prevSpv = spv.value;
+  var prevEx  = ex.value;
+  // Option `value` is the uuid (R1 — labels can repeat, uuid is the key).
+  // Display text shows the user-facing label + a short uuid suffix so two
+  // experiments named "agua" can be told apart.
   var opts='<option value="">-- select --</option>';
   for(var i=0;i<rows.length;i++){
-    opts+='<option value="'+esc(rows[i].exp_id)+'">'+esc(rows[i].exp_id)+'</option>';
+    var u = rows[i].uuid || '';
+    var label = (rows[i].exp_id||'?') + '  ['+u.slice(0,8)+']';
+    opts+='<option value="'+esc(u)+'">'+esc(label)+'</option>';
   }
-  document.getElementById('spvSel').innerHTML=opts;
-  document.getElementById('exSel').innerHTML=opts;
+  spv.innerHTML=opts;
+  ex.innerHTML=opts;
+  if(prevSpv && spv.querySelector('option[value="'+prevSpv.replace(/"/g,'\\"')+'"]')) spv.value = prevSpv;
+  if(prevEx  && ex.querySelector('option[value="'+prevEx.replace(/"/g,'\\"')+'"]'))   ex.value  = prevEx;
 }
 
-function viewSpectra(expId){
+function viewSpectra(uuid){
   showTab('spv');
-  document.getElementById('spvSel').value=expId;
+  document.getElementById('spvSel').value=uuid;
   loadSpectra();
 }
 
 function loadSpectra(){
-  var expId=document.getElementById('spvSel').value;
-  if(!expId) return;
+  var uuid=document.getElementById('spvSel').value;
+  if(!uuid){
+    // No selection — wipe the cached experiment so a stale chart cannot
+    // leak through (issue from earlier: graph kept showing the last fetch).
+    cache.spv={data:null,ts:0,uuid:null};
+    drawChartOn('spvChart', [], WAVELENGTHS, [], null, {xLabel:'Wavelength (nm)'});
+    drawChartOn('spvAbsChart', [], WAVELENGTHS, [], null, {xLabel:'Wavelength (nm)', yLabel:'Absorbance (a.u.)'});
+    drawChartOn('spvMeanChart', [], WAVELENGTHS, [], null, {xLabel:'Wavelength (nm)'});
+    document.querySelector('#spvTbl tbody').innerHTML='';
+    document.querySelector('#spvAbsTbl tbody').innerHTML='';
+    document.querySelector('#spvCfgTbl tbody').innerHTML='';
+    document.getElementById('spvChecks').innerHTML='';
+    return;
+  }
+  // Always force a fresh fetch — the cache is for the experiments LIST only,
+  // not the spectra of a specific experiment.  The dropdown must drive the
+  // chart 1-for-1 so the user always sees the experiment they selected.
   var spin=document.getElementById('spvSpin');
   spin.classList.remove('hidden');
-  fetch('/history/spectra?exp_id='+encodeURIComponent(expId))
+  fetch('/history/spectra?uuid='+encodeURIComponent(uuid))
     .then(function(r){return r.json();})
     .then(function(j){
-      cache.spv={data:j,ts:Date.now(),expId:expId};
+      cache.spv={data:j,ts:Date.now(),uuid:uuid,expId:j.exp_id};
       renderSpectraViewer(j);
     })
     .catch(function(e){ lg('spectra err: '+e.message); })
@@ -799,8 +1170,32 @@ function loadSpectra(){
 var spvVisible = [];
 
 function renderSpectraViewer(j){
+  // Acquisition config (issue #1) ─────────────────────────────────────────
+  var exp = j.experiment || {};
+  var cfgRows = [
+    ['Exp ID',           exp.exp_id||''],
+    ['UUID',             j.uuid||''],
+    ['Created at',       exp.created_at||''],
+    ['Timestamp (ms)',   exp.timestamp_ms||0],
+    ['# measurements',   exp.num_measurements||0],
+    ['N (calibration)',  exp.n_cal||0],
+    ['Gain',             gainLabel(exp.gain)],
+    ['Integration cycl', exp.int_cycles||0],
+    ['Mode',             exp.mode||0],
+    ['White LED (mA)',   (exp.led_white_ma||0)+(exp.led_white_on?'  ON':'  OFF')],
+    ['IR LED (mA)',      (exp.led_ir_ma   ||0)+(exp.led_ir_on   ?'  ON':'  OFF')],
+    ['UV LED (mA)',      (exp.led_uv_ma   ||0)+(exp.led_uv_on   ?'  ON':'  OFF')],
+    ['Cal valid',        exp.cal_valid?'YES':'NO'],
+    ['Cal gain (snap)',  gainLabel(exp.cal_gain)],
+    ['Cal int cycl (snap)', exp.cal_int_cycles||0],
+  ];
+  var cfgTb = document.querySelector('#spvCfgTbl tbody');
+  cfgTb.innerHTML = cfgRows.map(function(r){
+    return '<tr><th style="text-align:right;width:14rem">'+esc(r[0])+'</th><td>'+esc(String(r[1]))+'</td></tr>';
+  }).join('');
+
+  // Measurement-visibility checkboxes — default last 3 visible.
   var sp=j.spectra||[];
-  // Default: only the last 3 measurements are visible.
   spvVisible=[];
   for(var i=0;i<sp.length;i++) spvVisible.push(i >= sp.length-3);
 
@@ -819,78 +1214,145 @@ function renderSpectraViewer(j){
     })(i);
   }
 
-  var head=document.getElementById('spvHead');
   var wl=j.wavelengths||WAVELENGTHS;
+
+  // Transmittance table (T % per channel) — from the DB column directly.
+  var trans = j.transmittance || [];
+  var head=document.getElementById('spvHead');
   var h='<th>#</th>';
   for(var i=0;i<wl.length;i++) h+='<th>'+wl[i]+'</th>';
   head.innerHTML=h;
-
   var tb=document.querySelector('#spvTbl tbody');
   tb.innerHTML='';
-  if(j.offsets && j.offsets.length){
+  for(var i=0;i<trans.length;i++){
     var tr=document.createElement('tr');
-    var row='<td><em>Cal</em></td>';
-    for(var i=0;i<j.offsets.length;i++) row+='<td>'+j.offsets[i].toFixed(2)+'</td>';
+    var row='<td>'+(i+1)+'</td>';
+    for(var c=0;c<trans[i].length;c++) row+='<td>'+(+trans[i][c]).toFixed(2)+'</td>';
     tr.innerHTML=row;
     tb.appendChild(tr);
   }
-  for(var i=0;i<sp.length;i++){
+
+  // Absorbance table — same shape but values are −log10(T).
+  var absRows = j.absorbance || [];
+  var ah=document.getElementById('spvAbsHead');
+  var ahHTML='<th>#</th>';
+  for(var i=0;i<wl.length;i++) ahHTML+='<th>'+wl[i]+'</th>';
+  ah.innerHTML=ahHTML;
+  var atb=document.querySelector('#spvAbsTbl tbody');
+  atb.innerHTML='';
+  for(var i=0;i<absRows.length;i++){
     var tr=document.createElement('tr');
     var row='<td>'+(i+1)+'</td>';
-    for(var c=0;c<sp[i].length;c++) row+='<td>'+(+sp[i][c]).toFixed(2)+'</td>';
+    for(var c=0;c<absRows[i].length;c++){
+      var v=absRows[i][c];
+      row+='<td>'+(v==null?'—':(+v).toFixed(3))+'</td>';
+    }
     tr.innerHTML=row;
-    tb.appendChild(tr);
+    atb.appendChild(tr);
   }
 
   redrawSpv();
 }
 
+// Helper for the absorbance chart: it looks identical to the T% chart
+// (same channels, palette, overlay convention) but the y-axis is unbounded
+// from above (in practice 0..3 for most samples; we let drawChartOn auto-
+// scale by passing offsets=null).  The blank reference for absorbance is
+// A=0 by definition (T=100%), so we draw a flat dashed zero line.
+function drawAbsorbanceChart(rows, wl, labels){
+  drawChartOn('spvAbsChart', rows, wl, labels, null,
+              {xLabel:'Wavelength (nm)', yLabel:'Absorbance (a.u.)'});
+}
+
 function redrawSpv(){
   var j=cache.spv.data; if(!j) return;
+  // If the dropdown has moved on to another experiment since the cache was
+  // populated, do not repaint stale data — wait for loadSpectra() to finish.
+  var sel=document.getElementById('spvSel').value;
+  if(sel && cache.spv.uuid && cache.spv.uuid!==sel) return;
+
   var wl=j.wavelengths||WAVELENGTHS;
-  var all=j.spectra||[];
+  var trans=j.transmittance||[];
+  var absRows=j.absorbance||[];
 
-  // Plot 1: selected measurements (default last 3) + calibration offsets overlay.
-  var shown=[], labels=[];
-  for(var i=0;i<all.length;i++){
-    if(spvVisible[i]){ shown.push(all[i]); labels.push('Meas '+(i+1)); }
+  // Plot 1: selected transmittance rows + the implicit 100% reference.
+  // We pass `wl` as `offsets` only as a length-matching truthy sentinel —
+  // drawChartOn will detect transmittance mode via deltasToTransmittancePct
+  // → null path, but here the values are ALREADY percent.  To make the
+  // overlay render at 100, pass a dummy "offsets" array of length wl.length.
+  // A cleaner path: tell drawChartOn directly with a forced yLabel.
+  var shownT=[], labels=[];
+  for(var i=0;i<trans.length;i++){
+    if(spvVisible[i]){ shownT.push(trans[i]); labels.push('Meas '+(i+1)); }
   }
-  if(shown.length > 3){
-    // Keep at most the last 3 in the plot even if more are checked.
-    shown = shown.slice(-3);
-    labels = labels.slice(-3);
-  }
-  drawChartOn('spvChart', shown, wl, labels, j.offsets||null,
-              {xLabel:'Wavelength (nm)', yLabel:'Transmittance',
-               offsetsLabel:'Cal offset (blank ref.)'});
+  if(shownT.length > 3){ shownT = shownT.slice(-3); labels = labels.slice(-3); }
+  // The transmittance values from the DB are already in %; pass offsets=null
+  // and yLabel="Transmittance (%)" so drawChartOn skips the Δ→T conversion
+  // (deltasToTransmittancePct would otherwise misinterpret the input).
+  drawChartOn('spvChart', shownT, wl, labels, null,
+              {xLabel:'Wavelength (nm)', yLabel:'Transmittance (%)', yMax:100});
 
-  // Plot 2: calibration offsets vs per-channel mean across ALL measurements.
-  if(all.length && wl.length){
+  // Plot 2: absorbance, same selection.
+  var shownA=[];
+  for(var i=0;i<absRows.length;i++){
+    if(spvVisible[i]) shownA.push(absRows[i]);
+  }
+  if(shownA.length > 3) shownA = shownA.slice(-3);
+  drawAbsorbanceChart(shownA, wl, labels);
+
+  // Plot 3: per-channel mean of all transmittance rows.
+  if(trans.length && wl.length){
     var mean=new Array(wl.length); for(var k=0;k<wl.length;k++) mean[k]=0;
-    for(var i=0;i<all.length;i++){
-      for(var k=0;k<wl.length;k++) mean[k] += (+all[i][k])||0;
+    var n=0;
+    for(var i=0;i<trans.length;i++){
+      var ok=true;
+      for(var k=0;k<wl.length;k++){
+        var v=+trans[i][k];
+        if(!isFinite(v)){ ok=false; break; }
+        mean[k]+=v;
+      }
+      if(ok) n++;
     }
-    for(var k=0;k<wl.length;k++) mean[k] /= all.length;
-    drawChartOn('spvMeanChart', [mean], wl, ['Mean of '+all.length+' meas'],
-                j.offsets||null,
-                {xLabel:'Wavelength (nm)', yLabel:'Transmittance',
-                 offsetsLabel:'Cal offset (blank ref.)'});
+    if(n>0) for(var k=0;k<wl.length;k++) mean[k] /= n;
+    drawChartOn('spvMeanChart', [mean], wl, ['Mean of '+n+' meas (T %)'],
+                null,
+                {xLabel:'Wavelength (nm)', yLabel:'Transmittance (%)', yMax:100});
   } else {
     drawChartOn('spvMeanChart', [], wl, [], null,
-                {xLabel:'Wavelength (nm)', yLabel:'Transmittance'});
+                {xLabel:'Wavelength (nm)', yLabel:'Transmittance (%)', yMax:100});
   }
 }
 
 function doExport(fmt){
   var all=document.getElementById('exAll').checked;
-  var expId=document.getElementById('exSel').value;
-  var q = all ? 'all=true' : ('exp_id='+encodeURIComponent(expId||''));
-  if(!all && !expId){ alert('Select an experiment or check "Export all".'); return; }
+  var uuid=document.getElementById('exSel').value;       // populateExpSelect now keys by uuid
+  var q = all ? 'all=true' : ('uuid='+encodeURIComponent(uuid||''));
+  if(!all && !uuid){ alert('Select an experiment or check "Export all".'); return; }
   window.location.href='/history/export/'+fmt+'?'+q;
 }
 
 document.getElementById('exSel').addEventListener('change', estSize);
 document.getElementById('exAll').addEventListener('change', estSize);
+
+// Selecting an experiment in the Spectra Viewer dropdown must update the
+// chart immediately — previously it required a click on "Load", which left
+// the chart showing the last fetched dataset and made the UI feel broken.
+// The handler also fires when the user changes selection while the spectra
+// for the previous experiment are still being rendered: loadSpectra() always
+// issues a fresh fetch, so the chart will end up reflecting whichever
+// experiment was last selected.
+document.getElementById('spvSel').addEventListener('change', function(){
+  // Invalidate the cached spectra so any in-flight redraw cannot paint stale
+  // data over the chart between this fetch starting and resolving.  Cache
+  // shape after the uuid migration is {data, ts, uuid, expId}.
+  cache.spv = {data:null, ts:0, uuid:null, expId:null};
+  loadSpectra();
+});
+
+// Same convenience for the Export panel — keep the size estimate in sync.
+document.getElementById('exSel').addEventListener('change', function(){
+  // estSize is already wired above; nothing else needed here.
+});
 
 function estSize(){
   var all=document.getElementById('exAll').checked;

@@ -157,104 +157,118 @@ def delete_experiment(uuid):
         cur.close(); db.close()
 
 # ─── Manual import (issue #8.B) ─────────────────────────────────────────────
-# Format MUST match the device's SD layout (clarification #7):
-#   - Field `calibration` = the device's /calibrations.csv row for this exp
-#     (uuid, exp_id, gain, int_cycles, led_*_ma, led_*_on, ref_ch1..18)
-#   - Field `measurements` = the device's /spectra.csv rows for this exp
-#     (date, exp_id, uuid, meas_idx, gain, int_cycles, led_*_ma, led_*_on,
-#      cal_ch1..18, ch1..18)
-# The UI submits both files in one POST; calibration is uploaded FIRST in the
-# wizard so the user can confirm the binding before adding the measurements.
+# Single CSV file matching the device's v3 /spectra.csv schema (one row per
+# measurement, calibration inline).  An archive may carry 1..N experiments —
+# rows are grouped by `uuid` and inserted as separate experiments.  Each
+# experiment goes through the same store_experiment() path the MQTT bridge
+# uses, so the dashboard cannot tell device-uploaded from imported.
+#
+# Required columns (from sd_logger.cpp ensureHeader):
+#   uuid, exp_id, date, meas_idx, gain, int_cycles,
+#   white_led, white_mA, ir_led, ir_mA, uv_led, uv_mA, n_cal, cal_valid,
+#   cal_ch1..cal_ch18, ch1..ch18, t_ch1..t_ch18, a_ch1..a_ch18
 @app.route("/experiments/import", methods=["POST"])
 def import_experiment():
-    cal_file  = flask.request.files.get("calibration")
-    meas_file = flask.request.files.get("measurements")
-    if not cal_file or not meas_file:
-        return flask.jsonify({"error": "both calibration and measurements files required"}), 400
+    upload = (flask.request.files.get("file")
+              or flask.request.files.get("spectra")
+              or flask.request.files.get("measurements"))
+    if not upload:
+        return flask.jsonify({"error": "file required (form field 'file')"}), 400
 
     try:
-        cal_rows  = list(csv.DictReader(io.StringIO(cal_file.read().decode("utf-8"))))
-        meas_rows = list(csv.DictReader(io.StringIO(meas_file.read().decode("utf-8"))))
+        rows = list(csv.DictReader(io.StringIO(upload.read().decode("utf-8"))))
     except Exception as ex:
         return flask.jsonify({"error": f"parse failed: {ex}"}), 400
-
-    if not cal_rows or not meas_rows:
+    if not rows:
         return flask.jsonify({"error": "empty file"}), 400
 
-    # Group by uuid.  Both files MUST agree on uuid; one experiment per import.
-    cal_uuids  = {r["uuid"]  for r in cal_rows  if r.get("uuid")}
-    meas_uuids = {r["uuid"] for r in meas_rows if r.get("uuid")}
-    if len(cal_uuids) != 1 or cal_uuids != meas_uuids:
+    required_cols = {"uuid", "exp_id", "meas_idx",
+                     "gain", "int_cycles",
+                     "cal_ch1", "ch1", "t_ch1", "a_ch1"}
+    missing = required_cols - set(rows[0].keys())
+    if missing:
         return flask.jsonify({
-            "error": "uuid mismatch between calibration and measurements files",
-            "cal_uuids": sorted(cal_uuids),
-            "meas_uuids": sorted(meas_uuids),
+            "error": f"missing columns: {sorted(missing)}",
+            "hint": "file must match the device's /spectra.csv v3 schema",
         }), 400
-    uuid = next(iter(cal_uuids))
-    cal = cal_rows[0]
-    meas_rows = [r for r in meas_rows if r.get("uuid") == uuid]
+
+    # Group rows by uuid.  Order within a uuid follows the file order (which
+    # the device writes meas_idx-ordered) — we sort defensively in case the
+    # user hand-edited the CSV.
+    by_uuid = {}
+    for r in rows:
+        uid = r.get("uuid", "").strip()
+        if not uid:
+            continue
+        by_uuid.setdefault(uid, []).append(r)
+    if not by_uuid:
+        return flask.jsonify({"error": "no rows with a uuid column"}), 400
 
     def _floats(row, prefix, n=NCH):
-        return [float(row.get(f"{prefix}{i}", 0) or 0) for i in range(1, n + 1)]
-
-    payload = {
-        "uuid":   uuid,
-        "exp_id": cal.get("exp_id", ""),
-        "timestamp_ms": int(meas_rows[0].get("timestamp_ms", 0) or 0),
-        "num_measurements": len(meas_rows),
-        "n_cal":  int(cal.get("n_cal", 5) or 5),
-        "sensor": {
-            "gain":       int(cal.get("gain_int", 0) or 0),
-            "mode":       int(cal.get("mode", 3) or 3),
-            "int_cycles": int(cal.get("int_cycles", 0) or 0),
-            "led_white_ma": int(cal.get("led_white_ma", 0) or 0),
-            "led_ir_ma":    int(cal.get("led_ir_ma", 0) or 0),
-            "led_uv_ma":    int(cal.get("led_uv_ma", 0) or 0),
-            "led_white_on": cal.get("led_white_on") in ("ON", "1", "true", True),
-            "led_ir_on":    cal.get("led_ir_on")    in ("ON", "1", "true", True),
-            "led_uv_on":    cal.get("led_uv_on")    in ("ON", "1", "true", True),
-        },
-        "calibration": {
-            "valid":    cal.get("cal_valid") in ("1", "true", "True", True),
-            "offsets":  _floats(cal, "ref_ch"),
-            "cfg_at_cal": {
-                "gain":       int(cal.get("gain_int", 0) or 0),
-                "int_cycles": int(cal.get("int_cycles", 0) or 0),
-            },
-        },
-        "spectra":       [_floats(r, "ch") for r in meas_rows],
-        # T / A are recomputed below from the imported raw counts so we
-        # don't trust the file to have them.
-    }
-
-    offsets = payload["calibration"]["offsets"]
-    def _T(row):
         out = []
-        for i, d in enumerate(row):
-            I0 = offsets[i] if i < len(offsets) else 0
-            if I0 <= 0:
-                out.append(None); continue
-            I = d + I0
-            if I < 0: I = 0
-            out.append(I / I0 * 100.0)
-        return out
-    def _A(t_row):
-        out = []
-        for t in t_row:
-            if t is None or t <= 0:
+        for i in range(1, n + 1):
+            v = row.get(f"{prefix}{i}", "")
+            try:
+                out.append(float(v) if v not in ("", None) else None)
+            except ValueError:
                 out.append(None)
-            else:
-                import math
-                out.append(-math.log10(t / 100.0))
         return out
-    payload["transmittance"] = [_T(r) for r in payload["spectra"]]
-    payload["absorbance"]    = [_A(t) for t in payload["transmittance"]]
 
-    # Reuse the bridge code path for actual insert.  Importing here keeps the
-    # import response identical to a device-uploaded experiment.
+    # Gain may be stored either as the AS7265X enum integer (0..3) or as a
+    # human label ("16x").  Decode both.
+    gain_label_to_int = {"1x": 0, "4x": 1, "16x": 2, "64x": 3}
+    def _gain(v):
+        s = str(v).strip()
+        if s in gain_label_to_int: return gain_label_to_int[s]
+        try: return int(s)
+        except ValueError: return 0
+
+    def _on(v):
+        return str(v).strip().upper() in ("ON", "1", "TRUE", "YES")
+
+    imported, errors = [], []
     from mqtt_to_db import store_experiment
-    store_experiment(payload)
-    return flask.jsonify({"imported": uuid, "rows": len(meas_rows)})
+    for uid, group in by_uuid.items():
+        try:
+            group.sort(key=lambda r: int(r.get("meas_idx", 0) or 0))
+            head = group[0]
+            payload = {
+                "uuid":   uid,
+                "exp_id": head.get("exp_id", ""),
+                "timestamp_ms": 0,
+                "num_measurements": len(group),
+                "n_cal": int(head.get("n_cal", 0) or 0),
+                "sensor": {
+                    "gain":         _gain(head.get("gain", 0)),
+                    "mode":         3,
+                    "int_cycles":   int(head.get("int_cycles", 0) or 0),
+                    "led_white_ma": int(head.get("white_mA", 0) or 0),
+                    "led_ir_ma":    int(head.get("ir_mA",    0) or 0),
+                    "led_uv_ma":    int(head.get("uv_mA",    0) or 0),
+                    "led_white_on": _on(head.get("white_led", "")),
+                    "led_ir_on":    _on(head.get("ir_led",    "")),
+                    "led_uv_on":    _on(head.get("uv_led",    "")),
+                },
+                "calibration": {
+                    "valid": head.get("cal_valid") in ("1", "true", "True", True, 1),
+                    "offsets": _floats(head, "cal_ch"),
+                    "cfg_at_cal": {
+                        "gain":       _gain(head.get("gain", 0)),
+                        "int_cycles": int(head.get("int_cycles", 0) or 0),
+                    },
+                },
+                "spectra":       [_floats(r, "ch")   for r in group],
+                "transmittance": [_floats(r, "t_ch") for r in group],
+                "absorbance":    [_floats(r, "a_ch") for r in group],
+            }
+            store_experiment(payload)
+            imported.append({"uuid": uid, "exp_id": payload["exp_id"], "rows": len(group)})
+        except Exception as ex:
+            errors.append({"uuid": uid, "error": str(ex)})
+
+    status = 200 if imported and not errors else (207 if imported else 400)
+    return flask.jsonify({"imported": imported, "errors": errors,
+                          "total_uuids": len(by_uuid)}), status
 
 # ─── CSV / JSON export (legacy) ─────────────────────────────────────────────
 @app.route("/history/export/csv", methods=["GET"])
@@ -283,14 +297,49 @@ def _export(fmt):
         exps = cur.fetchall()
 
         if fmt == "csv":
+            # v3 layout — round-trippable through /experiments/import.
+            # Columns mirror sd_logger.cpp ensureHeader exactly.
+            gain_labels = ["1x", "4x", "16x", "64x"]
             out = io.StringIO(); w = csv.writer(out)
-            w.writerow(["uuid", "exp_id", "meas_index", "timestamp_ms",
-                        "gain", "int_cycles"] + [f"ch{i}" for i in range(1, NCH + 1)])
+            header = (["uuid", "exp_id", "date", "meas_idx",
+                       "gain", "int_cycles",
+                       "white_led", "white_mA", "ir_led", "ir_mA",
+                       "uv_led", "uv_mA", "n_cal", "cal_valid"]
+                      + [f"cal_ch{i}" for i in range(1, NCH + 1)]
+                      + [f"ch{i}"     for i in range(1, NCH + 1)]
+                      + [f"t_ch{i}"   for i in range(1, NCH + 1)]
+                      + [f"a_ch{i}"   for i in range(1, NCH + 1)])
+            w.writerow(header)
             for e in exps:
-                rows = _fetch_channels(cur, "mediciones", e["uuid"])
-                for i, row in enumerate(rows):
-                    w.writerow([e["uuid"], e.get("exp_id"), i, int(e.get("timestamp_ms") or 0),
-                                e.get("gain"), e.get("int_cycles")] + row)
+                # Pull all four channel blocks for this experiment.
+                spectra = _fetch_channels(cur, "mediciones",     e["uuid"])
+                trans   = _fetch_channels(cur, "transmittances", e["uuid"])
+                absorb  = _fetch_channels(cur, "absorbancias",   e["uuid"])
+                cur.execute("SELECT * FROM calibraciones WHERE uuid=%s", (e["uuid"],))
+                cal_row = cur.fetchone() or {}
+                cal_vec = [float(cal_row.get(f"ref_ch{i}", 0) or 0) for i in range(1, NCH + 1)]
+                date = (e.get("created_at") or "").isoformat() if hasattr(e.get("created_at"), "isoformat") \
+                       else str(e.get("created_at") or "")
+                gain_lbl = gain_labels[e.get("gain", 0)] if 0 <= (e.get("gain") or 0) < 4 else str(e.get("gain"))
+                meta_prefix = [
+                    e["uuid"], e.get("exp_id"), date,
+                    None,               # meas_idx — filled per row below
+                    gain_lbl, e.get("int_cycles"),
+                    "ON" if e.get("led_white_on") else "OFF", e.get("led_white_ma"),
+                    "ON" if e.get("led_ir_on")    else "OFF", e.get("led_ir_ma"),
+                    "ON" if e.get("led_uv_on")    else "OFF", e.get("led_uv_ma"),
+                    e.get("n_cal"), 1 if e.get("cal_valid") else 0,
+                ]
+                # Pad missing T/A rows with [None]*NCH so the column count
+                # stays constant even if processing failed for some rows.
+                pad = lambda lst, idx: lst[idx] if idx < len(lst) else [None] * NCH
+                for i, raw in enumerate(spectra):
+                    row = list(meta_prefix); row[3] = i
+                    row.extend(cal_vec)
+                    row.extend(raw)
+                    row.extend(pad(trans,  i))
+                    row.extend(pad(absorb, i))
+                    w.writerow(row)
             resp = flask.Response(out.getvalue(), mimetype="text/csv")
             resp.headers["Content-Disposition"] = 'attachment; filename="export.csv"'
             return resp

@@ -184,8 +184,17 @@
   </div>
 
   <div class="c full" id="chartCard">
-    <h2>Spectra (last 3 measurements)</h2>
+    <h2>Transmittance &mdash; last 3 measurements</h2>
     <canvas id="chart" class="cv" height="240"></canvas>
+  </div>
+
+  <!-- Live absorbance — same channels and palette as the T plot but with
+       A(λ) = −log10(T) on the Y axis.  Mirrors the ESP32 local UI layout
+       and reuses the same drawChartOn render path the DB viewer relies on,
+       so all four "last 3" widgets behave identically. -->
+  <div class="c full" id="chartAbsCard">
+    <h2>Absorbance &mdash; last 3 measurements</h2>
+    <canvas id="chartAbs" class="cv" height="240"></canvas>
   </div>
 
   <div class="c full hidden" id="liveCard">
@@ -225,21 +234,22 @@
     </div>
   </div>
 
-  <!-- Manual import wizard (issue #8.B + clarification #7) ───────────────
-       Calibration file FIRST (clarification #7), then measurements.  Both
-       must come from the device's SD layout so an offline pull is a
-       drop-in import. -->
+  <!-- Manual import (consolidated v3 schema) ─────────────────────────────
+       One CSV file, matching the device's /spectra.csv layout.  Each row
+       is one measurement; experiments are grouped by `uuid`.  An archive
+       can hold 1..N experiments — they all import as separate records. -->
   <div id="importDlg" class="hidden" style="position:fixed;inset:0;background:rgba(0,0,0,.85);
        z-index:200;display:flex;align-items:center;justify-content:center">
-    <div class="c" style="max-width:480px;width:90%">
-      <h2>Import Experiment from Computer</h2>
-      <p class="muted">Files must come from the device's SD card (calibrations.csv + spectra.csv).
-        Both must agree on the same uuid.  After insert the same post-processing runs as for a
-        live device upload.</p>
-      <label>1. Calibration file (calibrations.csv)</label>
-      <input type="file" id="impCal" accept=".csv,text/csv"/>
-      <label>2. Measurements file (spectra.csv)</label>
-      <input type="file" id="impMeas" accept=".csv,text/csv"/>
+    <div class="c" style="max-width:520px;width:90%">
+      <h2>Import experiments from computer</h2>
+      <p class="muted">Pick the device's <code>spectra.csv</code> (or any CSV that matches the v3
+        schema: <code>uuid, exp_id, date, meas_idx, gain, int_cycles, white_led, white_mA,
+        ir_led, ir_mA, uv_led, uv_mA, n_cal, cal_valid, cal_ch1..18, ch1..18, t_ch1..18,
+        a_ch1..18</code>).  One file may contain any number of experiments — they're grouped by
+        <code>uuid</code> and inserted as separate records.  Same post-processing runs as for a
+        live upload.</p>
+      <label>CSV file</label>
+      <input type="file" id="impFile" accept=".csv,text/csv"/>
       <div class="toolbar" style="margin-top:.6rem">
         <button class="bG" onclick="runImport()">Import</button>
         <button class="bR" onclick="document.getElementById('importDlg').classList.add('hidden')">Cancel</button>
@@ -335,7 +345,9 @@ var ESP_TIMEOUT_MS = 15000;
 
 // In-flight experiment buffer for issue #7 — driven by meas_progress events,
 // keyed by uuid so rows from a previous run can never leak into the current.
-var liveExp = {uuid:null, exp_id:null, rows:[], offsets:null, count:0};
+// `t_rows` / `a_rows` accumulate the device-computed T% / A vectors so the
+// live charts can render without recomputing anything in the browser.
+var liveExp = {uuid:null, exp_id:null, rows:[], t_rows:[], a_rows:[], count:0};
 // Most recent calibration from the device (offsets only).  Captured from
 // the next esp32/data/spectra publish; until we have one the live chart
 // renders without an overlay.
@@ -464,7 +476,7 @@ function onMqttMessage(m){
       drawChart(data);
       // Final-publish reset of the in-flight buffer — start clean for the
       // next experiment.
-      liveExp = {uuid:null, exp_id:null, rows:[], offsets:null, count:0};
+      liveExp = {uuid:null, exp_id:null, rows:[], t_rows:[], a_rows:[], count:0};
       setTimeout(function(){ loadExperiments(false); }, 800);
     }
   } else if(topic === 'esp32/data/upload'){
@@ -488,22 +500,28 @@ function onMqttMessage(m){
       var pct = data.n>0 ? Math.min(100, data.k/data.n*100) : 0;
       document.getElementById('prog').style.width=pct+'%';
       document.getElementById('progL').textContent='Meas '+data.k+' / '+data.n;
-      // Roll the in-flight row into a per-experiment buffer keyed by uuid
-      // so the Last Measurements plot updates incrementally — issue #7.
-      if(data.row && data.uuid){
+      // Roll the in-flight rows into a per-experiment buffer keyed by uuid
+      // so the Last Measurements + Absorbance plots both update
+      // incrementally.  v3 firmware ships t_row + a_row pre-computed in
+      // every meas_progress event — no client-side math needed, and no
+      // dependence on a previously-cached calibration vector.
+      if(data.uuid && (data.row || data.t_row)){
         if(!liveExp.uuid || liveExp.uuid!==data.uuid){
-          liveExp = {uuid:data.uuid, exp_id:data.exp_id, rows:[], offsets:null, count:0};
+          liveExp = {uuid:data.uuid, exp_id:data.exp_id, rows:[], t_rows:[], a_rows:[], count:0};
         }
-        liveExp.rows.push(data.row);
+        if(data.row)   liveExp.rows.push(data.row);
+        if(data.t_row) liveExp.t_rows.push(data.t_row);
+        if(data.a_row) liveExp.a_rows.push(data.a_row);
         liveExp.count = data.k;
-        // We don't have offsets in the live frame; use the most recent
-        // status-supplied calibration if present.  Falls back to no overlay.
-        drawChart({
-          spectra: liveExp.rows,
-          wavelengths: WAVELENGTHS,
-          count: data.k,
-          calibration: lastCal
-        });
+        // Take the last 3 of whichever buffer has data.  Both charts share
+        // the DB viewer's render path (drawChartOn) so they're guaranteed
+        // visually consistent with the post-load history view.
+        if(liveExp.t_rows.length){
+          drawChartLiveT(liveExp.t_rows.slice(-3), WAVELENGTHS, liveExp.count);
+        }
+        if(liveExp.a_rows.length){
+          drawChartLiveAbs(liveExp.a_rows.slice(-3), WAVELENGTHS, liveExp.count);
+        }
       }
     }
   } else if(topic === 'esp32/data/upload/error'){
@@ -604,6 +622,7 @@ function updBtns(s){
   var pullBtn=document.getElementById('bPull');
   if(pullBtn) pullBtn.disabled = !on || !espSeen || !idle;
   document.getElementById('chartCard').classList.toggle('hidden',live);
+  document.getElementById('chartAbsCard').classList.toggle('hidden',live);
   document.getElementById('liveCard').classList.toggle('hidden',!live);
 }
 
@@ -884,16 +903,67 @@ function drawChartOn(cvId, spectra, wavelengths, labels, offsets, opts){
   }
 }
 
+/* ─── Live "last 3" widgets — single render path shared with DB viewer ─────
+   Refactor: previously this function called drawChartOn with raw Δ values
+   and let the inner function autodetect transmittance mode.  That worked
+   for fully-saved experiments (where calibration accompanied the publish)
+   but failed during in-flight meas_progress events, which carry no
+   calibration on first run after page load — the chart fell back to raw
+   counts and looked broken.  We now ALWAYS render in T% / A space,
+   delegating to drawChartOn with the same options the DB viewer uses
+   (yMax:100 for T, auto-scale for A).  Two helpers, one for each axis,
+   so callers don't have to remember the option dictionary.
+   ───────────────────────────────────────────────────────────────────────── */
+function drawChartLiveT(rows, wl, count){
+  var n = rows.length;
+  var base = (count||n) - n;
+  var labels=[]; for(var i=0;i<n;i++) labels.push('Meas '+(base+i+1));
+  drawChartOn('chart', rows, wl||WAVELENGTHS, labels, null,
+              {xLabel:'Wavelength (nm)', yLabel:'Transmittance (%)', yMax:100});
+}
+function drawChartLiveAbs(rows, wl, count){
+  var n = rows.length;
+  var base = (count||n) - n;
+  var labels=[]; for(var i=0;i<n;i++) labels.push('Meas '+(base+i+1));
+  drawChartOn('chartAbs', rows, wl||WAVELENGTHS, labels, null,
+              {xLabel:'Wavelength (nm)', yLabel:'Absorbance (a.u.)'});
+}
+
+// Δ → T% recovery — used only when an old firmware payload arrives without
+// a transmittance array (live esp32/data/spectra publishes from v3 firmware
+// always include it).  Returns null on any I0 ≤ 0; the caller falls back
+// to whatever rows are available.
+function recoverTAfromRaw(spectra, offsets){
+  if(!offsets || !offsets.length) return null;
+  var out=[];
+  for(var r=0;r<spectra.length;r++){
+    var t=deltasToTransmittancePct(spectra[r], offsets);
+    if(!t) return null;
+    out.push(t);
+  }
+  return out;
+}
+
+// Single entry point used by the post-save spectra MQTT handler.  Takes
+// whatever shape the firmware sent — preferring device-computed T+A,
+// falling back to recompute from raw + offsets if a legacy payload sneaks
+// through — and renders both live "last 3" widgets together.
 function drawChart(data){
-  var sp=(data.spectra||[]).slice(-3);
-  var wl=data.wavelengths||WAVELENGTHS;
-  var base=(data.count||sp.length)-sp.length;
-  var labels=[]; for(var i=0;i<sp.length;i++) labels.push('Meas '+(base+i+1));
-  // Pass calibration offsets (I0) when valid so the chart can compute T%.
-  var offs = (data.calibration && data.calibration.valid && data.calibration.offsets &&
-              data.calibration.offsets.length===wl.length) ? data.calibration.offsets : null;
-  drawChartOn('chart', sp, wl, labels, offs,
-              {xLabel:'Wavelength (nm)'});
+  var wl=data.wavelengths || data.wavelengths_nm || WAVELENGTHS;
+  var count = data.count != null ? data.count : (data.num_measurements||0);
+
+  // Transmittance ────────────────────────────────────────────────────
+  var trows = (data.transmittance || []).slice(-3);
+  if(!trows.length && data.spectra){
+    var offs = (data.calibration && data.calibration.valid && data.calibration.offsets) || null;
+    var rec = recoverTAfromRaw((data.spectra||[]).slice(-3), offs);
+    if(rec) trows = rec;
+  }
+  if(trows.length) drawChartLiveT(trows, wl, count);
+
+  // Absorbance ───────────────────────────────────────────────────────
+  var arows = (data.absorbance || []).slice(-3);
+  if(arows.length) drawChartLiveAbs(arows, wl, count);
 }
 
 function wlClr(nm){
@@ -1085,22 +1155,35 @@ function bulkDelete(){
 }
 
 function runImport(){
-  var cal = document.getElementById('impCal').files[0];
-  var meas= document.getElementById('impMeas').files[0];
+  var f = document.getElementById('impFile').files[0];
   var msg = document.getElementById('impMsg');
-  if(!cal || !meas){ msg.textContent='Both files required (calibration + measurements).'; return; }
-  // Clarification #7 — calibration FIRST.  The form field order matches.
+  if(!f){ msg.textContent='Pick a CSV file first.'; return; }
   var fd = new FormData();
-  fd.append('calibration',  cal);
-  fd.append('measurements', meas);
+  fd.append('file', f);
   msg.textContent='Uploading...';
   fetch('/experiments/import', {method:'POST', body:fd})
-    .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
+    .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, status:r.status, j:j}; }); })
     .then(function(o){
-      if(!o.ok){ msg.textContent='Import failed: '+(o.j.error||'unknown'); return; }
-      msg.textContent='Imported '+(o.j.imported||'').slice(0,8)+' ('+o.j.rows+' rows)';
+      var j = o.j || {};
+      if(o.status >= 400 && !o.ok){
+        msg.textContent='Import failed: '+(j.error || 'unknown')+
+          (j.hint ? ('  ('+j.hint+')') : '');
+        return;
+      }
+      var imported = j.imported || [];
+      var errors   = j.errors   || [];
+      var lines = ['Imported '+imported.length+' / '+(j.total_uuids||imported.length)+' experiment(s).'];
+      imported.slice(0, 5).forEach(function(x){
+        lines.push('  • '+(x.exp_id||'?')+'  ['+(x.uuid||'').slice(0,8)+']  '+x.rows+' rows');
+      });
+      if(imported.length > 5) lines.push('  … and '+(imported.length - 5)+' more');
+      if(errors.length) lines.push('Errors: '+errors.length+' — see server log.');
+      msg.textContent = lines.join('\n');
+      msg.style.whiteSpace='pre-line';
       loadExperiments(true);
-      setTimeout(function(){ document.getElementById('importDlg').classList.add('hidden'); }, 1500);
+      if(!errors.length){
+        setTimeout(function(){ document.getElementById('importDlg').classList.add('hidden'); }, 2500);
+      }
     })
     .catch(function(e){ msg.textContent='Import err: '+e.message; });
 }

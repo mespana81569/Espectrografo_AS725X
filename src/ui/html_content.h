@@ -132,8 +132,15 @@ static const char HTML_CONTENT[] PROGMEM = R"rawhtml(
 
   <!-- Spectra chart -->
   <div class="c full" id="chartCard">
-    <h2>Spectra &mdash; transmittance vs wavelength (last 3 measurements)</h2>
+    <h2>Transmittance &mdash; last 3 measurements</h2>
     <canvas id="chart" class="cv" height="240"></canvas>
+  </div>
+
+  <!-- Absorbance chart — same channels, same color palette as the T plot.
+       A(λ) = −log10(T) ∈ [0, ~3] for typical samples. -->
+  <div class="c full" id="absCard">
+    <h2>Absorbance A(&lambda;) = &minus;log&#8321;&#8320;(T) (last 3 measurements)</h2>
+    <canvas id="absChart" class="cv" height="240"></canvas>
   </div>
 
   <!-- Live Monitor chart -->
@@ -220,6 +227,7 @@ function updBtns(s){
   document.getElementById('bMonStop').disabled= !live;
   document.getElementById('bWifi').disabled   = !idle;
   document.getElementById('chartCard').classList.toggle('hidden',live);
+  document.getElementById('absCard').classList.toggle('hidden',live);
   document.getElementById('liveCard').classList.toggle('hidden',!live);
 }
 
@@ -394,44 +402,26 @@ function drawChart(data){
   var W=rect.width,H=rect.height;
   ctx.clearRect(0,0,W,H);
 
-  if(!data || !data.spectra) return;
-
+  // /api/transmittance contract — { rows:[N][18], wavelengths:[18], count }.
+  // Each cell is already a percentage (0..100); device-computed.  No
+  // recomputation in the browser — same approach as the DB Spectra Viewer.
+  if(!data || !data.rows) return;
   var wl=data.wavelengths||[];
-  var offsets=(data.calValid && data.offsets && data.offsets.length===wl.length) ? data.offsets : null;
-
-  // Defensive copy + sanitize non-finite values to 0 (prevents blank charts
-  // when sensor returns NaN/Inf on high-irradiance or post-config reads).
-  // If calibration is valid, convert each row Δ → T% so the axis matches the
-  // physical quantity we claim to plot.
   var sp=[];
-  var raw=data.spectra.slice(-3);
+  var raw=data.rows.slice(-3);
   for(var i=0;i<raw.length;i++){
     if(!raw[i] || !raw[i].length) continue;
     var row=[];
     for(var j=0;j<raw[i].length;j++) row.push(fin(raw[i][j]));
-    if(offsets){
-      var t=deltasToTransmittancePct(row, offsets);
-      sp.push(t || row);                       // fallback to Δ if conversion fails
-    } else {
-      sp.push(row);
-    }
+    sp.push(row);
   }
   if(!sp.length||!wl.length)return;
 
-  var yLabel = offsets ? 'Transmittance (%)' : 'Counts (uncalibrated)';
-
-  // Fixed 0..100 axis when plotting transmittance — the percentage is bounded
-  // and a fixed scale makes the chart comparable across measurements.
-  var mx;
-  if(offsets){
-    mx=100;
-  } else {
-    mx=0;
-    for(var i=0;i<sp.length;i++) for(var j=0;j<sp[i].length;j++){
-      if(sp[i][j]>mx) mx=sp[i][j];
-    }
-    if(!isFinite(mx) || mx<=0) mx=1;
-  }
+  var yLabel = data.calValid===false ? 'Counts (uncalibrated)' : 'Transmittance (%)';
+  // Fixed 0..100 axis — bounded T means a stable scale across measurements.
+  var mx = 100;
+  // Has-overlay flag drives the dashed reference line below.
+  var offsets = (data.calValid !== false);
 
   var L=52,R=12,T=18,B=38;
   var pW=W-L-R,pH=H-T-B;
@@ -515,15 +505,117 @@ function drawChart(data){
 }
 
 function clearChart(){
-  var cv=document.getElementById('chart');
-  if(!cv)return;
-  var ctx=cv.getContext('2d');
+  ['chart','absChart'].forEach(function(id){
+    var cv=document.getElementById(id);
+    if(!cv)return;
+    var ctx=cv.getContext('2d');
+    var rect=cv.getBoundingClientRect();
+    var dpr=window.devicePixelRatio||1;
+    cv.width=rect.width*dpr;cv.height=rect.height*dpr;
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.scale(dpr,dpr);
+    ctx.clearRect(0,0,rect.width,rect.height);
+  });
+}
+
+/* ─── Absorbance chart ──────────────────────────────────────────────────────
+   A(λ) = −log₁₀(T) where T is the transmittance fraction (0..1).
+   Computed on-device by MeasurementEngine::computeProcessed and served at
+   /api/absorbance.  Range is unbounded above; in practice typical samples
+   sit in 0..3 a.u., so we let the chart auto-scale to whatever the data is.
+   `null` cells (uncomputable channels — saturation, no calibration, etc.)
+   are skipped in the line trace.
+   ─────────────────────────────────────────────────────────────────────── */
+function drawAbsorbance(data){
+  var cv=document.getElementById('absChart');
+  if(!cv) return;
   var rect=cv.getBoundingClientRect();
+  if(rect.width < 10){
+    requestAnimationFrame(function(){ drawAbsorbance(data); });
+    return;
+  }
+  var ctx=cv.getContext('2d');
   var dpr=window.devicePixelRatio||1;
   cv.width=rect.width*dpr;cv.height=rect.height*dpr;
   ctx.setTransform(1,0,0,1,0,0);
   ctx.scale(dpr,dpr);
-  ctx.clearRect(0,0,rect.width,rect.height);
+  var W=rect.width,H=rect.height;
+  ctx.clearRect(0,0,W,H);
+
+  if(!data) return;
+  var rows = (data.rows || []).slice(-3);
+  var wl = data.wavelengths || [];
+  if(!rows.length || !wl.length) return;
+
+  // Find max ignoring null/non-finite cells.  Floor at a small positive so
+  // the axis still draws when all values are zero (otherwise pH=0 → div0).
+  var mx=0;
+  for(var i=0;i<rows.length;i++) for(var j=0;j<rows[i].length;j++){
+    var v=rows[i][j];
+    if(typeof v==='number' && isFinite(v) && v>mx) mx=v;
+  }
+  if(!isFinite(mx) || mx<=0) mx=1;
+  // Round mx up to a nice 0.5 step for readable y-axis labels.
+  mx = Math.ceil(mx * 2) / 2;
+
+  var L=52,R=12,T=18,B=38;
+  var pW=W-L-R,pH=H-T-B;
+
+  ctx.strokeStyle='#334155';ctx.lineWidth=0.5;
+  for(var i=0;i<=4;i++){
+    var y=T+pH*(1-i/4);
+    ctx.beginPath();ctx.moveTo(L,y);ctx.lineTo(W-R,y);ctx.stroke();
+  }
+  ctx.fillStyle='#94a3b8';ctx.font='9px sans-serif';ctx.textAlign='center';
+  for(var i=0;i<wl.length;i+=3){
+    var x=L+(i/(wl.length-1))*pW;
+    ctx.fillText(wl[i],x,H-22);
+  }
+  ctx.textAlign='right';
+  for(var i=0;i<=4;i++){
+    var y=T+pH*(1-i/4);
+    ctx.fillText((mx*i/4).toFixed(2),L-4,y+3);
+  }
+  ctx.fillStyle='#e2e8f0';ctx.font='11px sans-serif';
+  ctx.textAlign='center';
+  ctx.fillText('Wavelength (nm)', L+pW/2, H-6);
+  ctx.save();
+  ctx.translate(12, T+pH/2);
+  ctx.rotate(-Math.PI/2);
+  ctx.textAlign='center';
+  ctx.fillText('Absorbance (a.u.)', 0, 0);
+  ctx.restore();
+
+  var clr=['#f87171','#fbbf24','#a78bfa'];
+  for(var s=0;s<rows.length;s++){
+    ctx.strokeStyle=clr[s%3];ctx.lineWidth=2;ctx.beginPath();
+    var started=false;
+    for(var i=0;i<rows[s].length;i++){
+      var v=rows[s][i];
+      if(typeof v!=='number' || !isFinite(v)) { started=false; continue; }
+      var x=L+(i/(rows[s].length-1))*pW;
+      var y=T+pH*(1-v/mx);
+      if(!started){ ctx.moveTo(x,y); started=true; } else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+    ctx.fillStyle=clr[s%3];
+    for(var i=0;i<rows[s].length;i++){
+      var v=rows[s][i];
+      if(typeof v!=='number' || !isFinite(v)) continue;
+      var x=L+(i/(rows[s].length-1))*pW;
+      var y=T+pH*(1-v/mx);
+      ctx.beginPath();ctx.arc(x,y,2,0,6.28);ctx.fill();
+    }
+  }
+
+  ctx.font='10px sans-serif';ctx.textAlign='left';
+  var total=fin(data.count)||rows.length;
+  for(var s=0;s<rows.length;s++){
+    var lx=L+4+s*80;
+    ctx.fillStyle=clr[s%3];
+    ctx.fillRect(lx,T+1,10,3);
+    ctx.fillText('Meas '+(total-rows.length+s+1),lx+14,T+7);
+  }
 }
 
 /* ─── Live Monitor ─────────────────────────────────────────────────────── */
@@ -611,9 +703,17 @@ function statusLoop(){
 }
 
 function spectraLoop(){
-  api('/api/spectra').then(function(d){
-    if(d && d.count>0) drawChart(d);
-    else if(d) clearChart();
+  // Both endpoints return device-computed values with the same shape:
+  //   { uuid, expId, count, calValid, wavelengths:[], rows:[N][18] }
+  // We pass the rows straight to the chart helpers — same code path the
+  // dashboard's DB viewer uses, so the two surfaces always match.  No
+  // Δ→T% conversion happens here anymore.
+  Promise.all([api('/api/transmittance'), api('/api/absorbance')]).then(function(r){
+    var t = r[0], a = r[1];
+    var any = (t && t.rows && t.rows.length) || (a && a.rows && a.rows.length);
+    if(!any){ clearChart(); return; }
+    if(t && t.rows && t.rows.length) drawChart(t);
+    if(a && a.rows && a.rows.length) drawAbsorbance(a);
   });
   setTimeout(spectraLoop,3000);
 }

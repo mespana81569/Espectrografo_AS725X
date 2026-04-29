@@ -464,16 +464,37 @@ void MqttClient::publishLiveFrames() {
         if (k != _lastMeasK && k > 0) {
             _lastMeasK = k;
             // Include the most recent row so the dashboard's "last
-            // measurements" plot can update incrementally — without this,
-            // users only see the experiment after it's fully uploaded.
+            // measurements" plot can update incrementally.  We ship the raw
+            // Δ AND a per-channel T% / A row computed on the fly from the
+            // experiment's calibration — without these the dashboard had no
+            // way to render in T% space during acquisition (no calibration
+            // had been published yet on the first run after page load).
+            const CalibrationData& cal = exp.calibration;
+            float trow[NUM_CHANNELS], arow[NUM_CHANNELS];
+            for (int c = 0; c < NUM_CHANNELS; c++) {
+                float I0 = cal.valid ? cal.offset[c] : 0.0f;
+                if (!cal.valid || I0 <= 0.0f) {
+                    trow[c] = NAN; arow[c] = NAN; continue;
+                }
+                float I = exp.spectra[k - 1][c] + I0;
+                if (I < 0.0f) I = 0.0f;
+                float Tp = (I / I0) * 100.0f;
+                trow[c] = Tp;
+                arow[c] = (Tp > 0.0f) ? -log10f(Tp / 100.0f) : NAN;
+            }
             String out;
-            out.reserve(384);
+            out.reserve(640);
             out += "{\"phase\":\"measurement\",\"uuid\":\"";
             out += exp.uuid;
             out += "\",\"exp_id\":\""; out += exp.experiment_id;
             out += "\",\"k\":"; out += k; out += ",\"n\":"; out += n;
+            out += ",\"cal_valid\":"; out += cal.valid ? "true" : "false";
             out += ",\"row\":";
             appendFloatArray(out, exp.spectra[k - 1], NUM_CHANNELS);
+            out += ",\"t_row\":";
+            appendFloatArray(out, trow, NUM_CHANNELS, 3);
+            out += ",\"a_row\":";
+            appendFloatArray(out, arow, NUM_CHANNELS, 4);
             out += "}";
             _client.publish(MQTT_TOPIC_DATA_MEAS_PROGRESS, out.c_str(), false);
         }
@@ -564,27 +585,23 @@ String MqttClient::buildExperimentJson(const Experiment& exp) {
     return out;
 }
 
-// Group payload reconstructed from CSV during the SD bulk-upload pass.
+// Group payload reconstructed from the v3 consolidated CSV.
 //
-// IMPORTANT: this payload contains ONLY raw Δ + offsets — transmittance and
-// absorbance are NOT included.  Reasoning:
-//   * Each (T row + A row) doubles the byte count vs. raw alone.  A 20-
-//     measurement experiment with raw+T+A pushed past the historical 4 KB
-//     buffer and any oversized publish silently fails (PubSubClient returns
-//     false; the previous code "logged FAIL" and moved on, dropping the
-//     entire experiment).
-//   * The bridge (server/mqtt_to_db.py) recomputes T+A from raw+offsets on
-//     ingest — same math, no data dependence.  See store_experiment().
-// Live-side spectra publishes (publishExperiment) still include T+A because
-// they're produced fresh on-device and the dashboard wants to render them
-// without waiting for the bridge round-trip.
+// The CSV now stores transmittance + absorbance INLINE (computed on-device
+// at acquisition time), so we can ship them straight through to the bridge
+// without recomputation.  Bridge prefers device-supplied T+A whenever
+// present (mqtt_to_db.py store_experiment) — only falls back to recompute
+// when T+A is missing from the payload.
+//
+// Payload size budget: 86 cols × 4-decimal floats ≈ ~5–6 KB for a 20-meas
+// experiment.  Comfortably below the 16 KB MQTT buffer.
 String MqttClient::buildGroupJson() const {
     String out;
-    out.reserve(8192);
+    out.reserve(12288);
     out += "{\"uuid\":\"";          out += _group.uuid;
     out += "\",\"exp_id\":\"";      out += _group.exp_id;
     out += "\",\"timestamp_ms\":0,\"num_measurements\":"; out += _group.count;
-    out += ",\"n_cal\":0";  // not preserved in the CSV layout — best-effort
+    out += ",\"n_cal\":";           out += _group.n_cal;
     out += ",\"sensor\":{\"gain\":";  out += _group.gain_int;
     out += ",\"mode\":";              out += _group.mode;
     out += ",\"int_cycles\":";        out += _group.int_cycles;
@@ -605,9 +622,16 @@ String MqttClient::buildGroupJson() const {
         if (i) out += ",";
         appendFloatArray(out, _group.spectra[i], NUM_CHANNELS);
     }
-    // T+A intentionally OMITTED here (see header docblock above) — bridge
-    // recomputes them from raw + offsets so the bulk-upload payload stays
-    // small enough to never overflow the MQTT buffer.
+    out += "],\"transmittance\":[";
+    for (int i = 0; i < _group.count; i++) {
+        if (i) out += ",";
+        appendFloatArray(out, _group.transmittance[i], NUM_CHANNELS, 3);
+    }
+    out += "],\"absorbance\":[";
+    for (int i = 0; i < _group.count; i++) {
+        if (i) out += ",";
+        appendFloatArray(out, _group.absorbance[i], NUM_CHANNELS, 4);
+    }
     out += "],\"wavelengths_nm\":";
     appendWavelengths(out);
     out += "}";
@@ -676,37 +700,35 @@ bool MqttClient::uploadOpenFile() {
     return true;
 }
 
-// Parse one CSV line into the group buffer. If lineIsFirstOfGroup, populate
-// the header/config/calibration slots; always append the spectra row.
-// Returns false on malformed row (row skipped).
+// Parse one CSV line into the group buffer.
 //
-// New column layout (after R1 / clarification #6):
-//   col 0  uuid           (RFC 4122 v4 string)
-//   col 1  exp_id         (user label)
-//   col 2  date
-//   col 3  meas_idx
-//   col 4  gain           (numeric AS7265X enum 0..3)
-//   col 5  int_cycles
-//   col 6  white_led      ("ON"/"OFF")
-//   col 7  white_mA
-//   col 8  ir_led         ("ON"/"OFF")
-//   col 9  ir_mA
-//   col 10 uv_led         ("ON"/"OFF")
-//   col 11 uv_mA
-//   col 12..29  cal_*18  (blank reference per channel)
-//   col 30..47  ch_*18   (Δ counts per channel)
-// → 12 metadata + 18 cal + 18 meas = 48 columns.
+// v3 column layout (matches sd_logger.cpp ensureHeader):
+//   col  0       uuid                              (RFC 4122 v4)
+//   col  1       exp_id                            (user label)
+//   col  2       date
+//   col  3       meas_idx
+//   col  4       gain                              ("1x"/"4x"/"16x"/"64x")
+//   col  5       int_cycles
+//   col  6..11   white_led, white_mA, ir_led, ir_mA, uv_led, uv_mA
+//   col  12      n_cal
+//   col  13      cal_valid                         (0/1)
+//   col  14..31  cal_ch1..cal_ch18                 (blank reference I0)
+//   col  32..49  ch1..ch18                         (raw Δ counts)
+//   col  50..67  t_ch1..t_ch18                     (transmittance %)
+//   col  68..85  a_ch1..a_ch18                     (absorbance a.u.)
+// → 14 metadata + 18 cal + 18 raw + 18 T + 18 A = 86 columns.
+//
+// Empty cells (NaN sentinel — see sd_logger's wf helper) are read as 0.0 by
+// atof(""), which the bridge will treat as a normal value.  We could also
+// emit JSON null here, but the dashboard already handles 0 gracefully.
 static bool parseRowIntoGroup(char* line, MqttClient::UploadGroup& g, bool isFirstOfGroup) {
-    char* fields[64];
-    int nf = splitCsv(line, fields, 64);
-    if (nf < 48) return false;
+    char* fields[96];
+    int nf = splitCsv(line, fields, 96);
+    if (nf < 86) return false;
 
     if (isFirstOfGroup) {
         strncpy(g.uuid,   fields[0], sizeof(g.uuid)   - 1); g.uuid[sizeof(g.uuid)   - 1] = 0;
         strncpy(g.exp_id, fields[1], sizeof(g.exp_id) - 1); g.exp_id[sizeof(g.exp_id) - 1] = 0;
-        // gain column is now numeric (sd_logger writes int casted from enum).
-        // atoi("16x") returns 16 — wrong; with the new schema we always get
-        // a small int 0..3.  Defensive: if the field is empty fall back to 16x.
         g.gain_int     = (fields[4][0] >= '0' && fields[4][0] <= '9')
                          ? atoi(fields[4]) : gainStrToInt(fields[4]);
         g.int_cycles   = atoi(fields[5]);
@@ -717,19 +739,18 @@ static bool parseRowIntoGroup(char* line, MqttClient::UploadGroup& g, bool isFir
         g.led_ir_ma    = atoi(fields[9]);
         g.led_uv_en    = (!strcmp(fields[10], "ON"));
         g.led_uv_ma    = atoi(fields[11]);
+        g.n_cal        = atoi(fields[12]);
+        g.cal_valid    = (atoi(fields[13]) != 0);
 
-        bool anyNonZero = false;
-        for (int i = 0; i < NUM_CHANNELS; i++) {
-            g.offsets[i] = atof(fields[12 + i]);
-            if (g.offsets[i] != 0.0f) anyNonZero = true;
-        }
-        g.cal_valid = anyNonZero;
+        for (int i = 0; i < NUM_CHANNELS; i++) g.offsets[i] = atof(fields[14 + i]);
         g.count = 0;
     }
 
     if (g.count < MAX_MEASUREMENTS) {
         for (int i = 0; i < NUM_CHANNELS; i++) {
-            g.spectra[g.count][i] = atof(fields[30 + i]);
+            g.spectra      [g.count][i] = atof(fields[32 + i]);
+            g.transmittance[g.count][i] = atof(fields[50 + i]);
+            g.absorbance   [g.count][i] = atof(fields[68 + i]);
         }
         g.count++;
     }
@@ -758,9 +779,9 @@ bool MqttClient::uploadReadNextGroup() {
         // experiments named "agua" with different uuids will NOT be merged.
         char buf[2048];
         line.toCharArray(buf, sizeof(buf));
-        char* fields[64];
-        int nf = splitCsv(buf, fields, 64);
-        if (nf < 48) continue;  // malformed, skip
+        char* fields[96];
+        int nf = splitCsv(buf, fields, 96);
+        if (nf < 86) continue;  // malformed, skip — see parseRowIntoGroup
 
         if (_group.count == 0) {
             char buf2[2048];

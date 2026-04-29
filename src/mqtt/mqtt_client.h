@@ -95,10 +95,16 @@ public:
         bool  led_white_en;
         bool  led_ir_en;
         bool  led_uv_en;
-        float offsets[NUM_CHANNELS];
+        int   n_cal;             // N samples averaged for the blank reference
         bool  cal_valid;
+        float offsets[NUM_CHANNELS];
         int   count;
-        float spectra[MAX_MEASUREMENTS][NUM_CHANNELS];
+        // v3 layout: spectra/transmittance/absorbance ALL come from the CSV
+        // (no recomputation in the firmware bulk path — they were computed
+        // by computeProcessed() at acquisition time and persisted).
+        float spectra      [MAX_MEASUREMENTS][NUM_CHANNELS];
+        float transmittance[MAX_MEASUREMENTS][NUM_CHANNELS];
+        float absorbance   [MAX_MEASUREMENTS][NUM_CHANNELS];
     };
 
 private:

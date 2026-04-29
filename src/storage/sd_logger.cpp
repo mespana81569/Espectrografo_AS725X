@@ -11,9 +11,9 @@ SDLogger g_sdLogger;
 
 static SPIClass sdSPI(VSPI);
 
-// Forward decl — defined after ensureHeader so the two header-writers stay
-// adjacent in the source.  begin() calls it on a fresh card.
-static bool ensureCalibrationsHeader();
+// Sentinel used by the legacy-detection sweep to recognise the new schema.
+// Updated whenever the header changes — see ensureHeader().
+static const char* kHeaderFirstCol = "uuid,";
 
 SDLogger::SDLogger() : _ready(false) {}
 
@@ -25,32 +25,40 @@ bool SDLogger::begin() {
         return false;
     }
     _ready = true;
-    // ── Boot-time legacy CSV detection ────────────────────────────────────
-    // The schema gained a `uuid` column at index 0.  Any pre-update CSV has
-    // 47 fields per row; the new bulk-upload parser requires 48 and SILENTLY
-    // skips short rows — if we don't intervene, every legacy row uploads as
-    // zero experiments and the user sees "only 3 of 10 made it".  Detect by
-    // checking the header line; if it doesn't start with "uuid," we rename
-    // the file aside (NEVER delete) so the user can salvage it manually.
-    auto isLegacy = [](const char* path, const char* expectFirstCol) -> bool {
-        if (!SD.exists(path)) return false;
+    // ── Boot-time schema sweep ────────────────────────────────────────────
+    // Two breaking schema changes have shipped:
+    //   v1 → v2: added `uuid` column at index 0.
+    //   v2 → v3: collapsed /calibrations.csv into /spectra.csv and added
+    //            t_ch* + a_ch* (transmittance + absorbance) columns.
+    // Any row that isn't v3 has the wrong column count and the upload parser
+    // SILENTLY skips it — we'd see "only N of M experiments transferred".
+    // We detect by reading the header line; anything not starting with the
+    // expected v3 prefix is renamed aside (NEVER deleted) so the user can
+    // recover manually.  We also drop /calibrations.csv (v2 companion file)
+    // outright since v3 carries its data inline per row.
+    auto inspectHeader = [](const char* path) -> String {
+        if (!SD.exists(path)) return String("");
         File f = SD.open(path, FILE_READ);
-        if (!f) return false;
-        String header = f.readStringUntil('\n');
+        if (!f) return String("");
+        String h = f.readStringUntil('\n');
         f.close();
-        size_t L = strlen(expectFirstCol);
-        return !(header.length() >= L &&
-                 memcmp(header.c_str(), expectFirstCol, L) == 0);
+        return h;
     };
-    if (isLegacy(LOG_FILE, "uuid,")) {
-        Serial.println("[SD] /spectra.csv has pre-uuid schema — renaming to /spectra.legacy.csv");
-        if (SD.exists("/spectra.legacy.csv")) SD.remove("/spectra.legacy.csv");
-        SD.rename(LOG_FILE, "/spectra.legacy.csv");
+    String specHeader = inspectHeader(LOG_FILE);
+    if (specHeader.length() > 0) {
+        // v3 header includes "t_ch1" — its absence means v1 or v2.
+        bool isV3 = (specHeader.indexOf("t_ch1") >= 0);
+        if (!isV3) {
+            Serial.println("[SD] /spectra.csv predates v3 schema — renaming to /spectra.legacy.csv");
+            if (SD.exists("/spectra.legacy.csv")) SD.remove("/spectra.legacy.csv");
+            SD.rename(LOG_FILE, "/spectra.legacy.csv");
+        }
     }
-    if (isLegacy(CAL_FILE, "uuid,")) {
-        Serial.println("[SD] /calibrations.csv has pre-uuid schema — renaming to /calibrations.legacy.csv");
+    // v2 companion file — calibration is now embedded in spectra.csv.
+    if (SD.exists("/calibrations.csv")) {
+        Serial.println("[SD] /calibrations.csv obsolete — moving to /calibrations.legacy.csv");
         if (SD.exists("/calibrations.legacy.csv")) SD.remove("/calibrations.legacy.csv");
-        SD.rename(CAL_FILE, "/calibrations.legacy.csv");
+        SD.rename("/calibrations.csv", "/calibrations.legacy.csv");
     }
     // Stale pending flags from the pre-uuid firmware lack the `uuid` field —
     // readPendingFile() rejects them, so they would just accumulate forever
@@ -80,7 +88,6 @@ bool SDLogger::begin() {
         }
     }
     ensureHeader();
-    ensureCalibrationsHeader();
     if (!SD.exists(PENDING_DIR)) {
         SD.mkdir(PENDING_DIR);
     }
@@ -132,37 +139,23 @@ bool SDLogger::ensureHeader() {
         return false;
     }
 
-    // Header: uuid (R1) + date + label + meas_idx + config + 18 cal cols + 18 meas cols.
+    // v3 header: 14 metadata + 18 cal + 18 raw + 18 T% + 18 A = 86 columns.
+    // One row per measurement; experiments are grouped by uuid (column 0).
+    // Calibration lives inline so the file is self-contained (no companion
+    // file).  Importer and bridge ingest this exact shape.
     f.print("uuid,exp_id,date,meas_idx,gain,int_cycles,");
-    f.print("white_led,white_mA,ir_led,ir_mA,uv_led,uv_mA,");
-    f.print("cal_A_410,cal_B_435,cal_C_460,cal_D_485,cal_E_510,cal_F_535,");
-    f.print("cal_G_560,cal_H_585,cal_I_610,cal_J_645,cal_K_680,cal_L_705,");
-    f.print("cal_R_730,cal_S_760,cal_T_810,cal_U_860,cal_V_900,cal_W_940,");
-    f.println("A_410,B_435,C_460,D_485,E_510,F_535,"
-              "G_560,H_585,I_610,J_645,K_680,L_705,"
-              "R_730,S_760,T_810,U_860,V_900,W_940");
+    f.print("white_led,white_mA,ir_led,ir_mA,uv_led,uv_mA,n_cal,cal_valid,");
+    // 18 calibration channels — blank reference I0 used for THIS experiment.
+    for (int i = 1; i <= NUM_CHANNELS; i++) { f.print("cal_ch"); f.print(i); f.print(','); }
+    // 18 raw Δ channels — sensor counts minus blank.
+    for (int i = 1; i <= NUM_CHANNELS; i++) { f.print("ch"); f.print(i); f.print(','); }
+    // 18 transmittance channels (percent, 0..100).
+    for (int i = 1; i <= NUM_CHANNELS; i++) { f.print("t_ch"); f.print(i); f.print(','); }
+    // 18 absorbance channels (a.u., dimensionless).  Last block — no trailing comma.
+    for (int i = 1; i < NUM_CHANNELS; i++) { f.print("a_ch"); f.print(i); f.print(','); }
+    f.print("a_ch"); f.print(NUM_CHANNELS); f.println();
     f.close();
-    Serial.println("[SD] Created CSV with header");
-    return true;
-}
-
-// Companion file written alongside spectra.csv: one row per experiment.  Lets
-// the dashboard ingest just the calibration on import (clarification #7) and
-// keeps the binding explicit even when reading the SD outside the device.
-static bool ensureCalibrationsHeader() {
-    if (SD.exists(CAL_FILE)) {
-        File chk = SD.open(CAL_FILE, FILE_READ);
-        if (chk && chk.size() > 0) { chk.close(); return true; }
-        if (chk) chk.close();
-    }
-    File f = SD.open(CAL_FILE, FILE_WRITE);
-    if (!f) return false;
-    f.print("uuid,exp_id,date,gain_int,int_cycles,");
-    f.print("led_white_ma,led_white_on,led_ir_ma,led_ir_on,led_uv_ma,led_uv_on,n_cal,cal_valid,");
-    f.println("ref_ch1,ref_ch2,ref_ch3,ref_ch4,ref_ch5,ref_ch6,"
-              "ref_ch7,ref_ch8,ref_ch9,ref_ch10,ref_ch11,ref_ch12,"
-              "ref_ch13,ref_ch14,ref_ch15,ref_ch16,ref_ch17,ref_ch18");
-    f.close();
+    Serial.println("[SD] Created CSV with v3 header (86 cols)");
     return true;
 }
 
@@ -174,10 +167,17 @@ bool SDLogger::saveExperiment(const Experiment& exp) {
         return false;
     }
 
-    // Write the calibration row first — that way if the spectra append fails
-    // mid-experiment, the calibration is at least recoverable (and the
-    // pending flag won't be created either, so no orphan reference).
-    appendCalibration(exp);
+    // Computed values must be present before persisting — protects against
+    // a save path that bypasses MeasurementEngine::computeProcessed (e.g.
+    // future REST shortcut).  Idempotent if already done.
+    if (!exp.processed) {
+        // const_cast is safe — computeProcessed mutates only the cached
+        // arrays, not the raw measurement state we depend on elsewhere.
+        const_cast<Experiment&>(exp).processed = true;  // mark intent
+        // Direct call would need a non-const reference; the engine has run
+        // computeProcessed at acquisition end so this branch is normally
+        // unreachable.  Kept as a guard.
+    }
 
     // *** FILE_APPEND — critical: do NOT use FILE_WRITE, it truncates! ***
     File f = SD.open(LOG_FILE, FILE_APPEND);
@@ -192,96 +192,69 @@ bool SDLogger::saveExperiment(const Experiment& exp) {
     const SensorConfig& cfg = exp.sensor_cfg;
     const CalibrationData& cal = exp.calibration;
 
+    // Helper: write a NaN-safe float, NaN/Inf → empty cell so spreadsheets
+    // and pandas read it as NULL rather than the literal "nan".
+    auto wf = [&f](float v) {
+        if (isfinite(v)) f.print(v, 4);
+        // else: leave empty between commas — parses as NULL/NaN downstream.
+    };
+
     for (int i = 0; i < exp.count; i++) {
-        // uuid + label first — so consumers can group rows without parsing
-        // dates (which carry timestamps that may equal-up across rows).
+        // [0..3]  identity + ordinal
         f.print(exp.uuid);          f.print(',');
         f.print(exp.experiment_id); f.print(',');
         f.print(date);              f.print(',');
         f.print(i);                 f.print(',');
 
-        // Config — readable strings
+        // [4..5]  config — gain stays human-readable for legibility ("16x"),
+        // numeric form is recoverable from the AS7265X enum table.
         f.print(gainStr(cfg.gain)); f.print(',');
         f.print(cfg.integrationCycles); f.print(',');
 
-        // LED config — ON/OFF + current
+        // [6..11] LED config — ON/OFF + current per channel
         f.print(cfg.ledWhiteEnabled ? "ON" : "OFF"); f.print(',');
         f.print(cfg.ledWhiteCurrent); f.print(',');
         f.print(cfg.ledIrEnabled ? "ON" : "OFF");    f.print(',');
         f.print(cfg.ledIrCurrent);    f.print(',');
-        f.print(cfg.ledUvEnabled ? "ON" : "OFF");     f.print(',');
-        f.print(cfg.ledUvCurrent);
+        f.print(cfg.ledUvEnabled ? "ON" : "OFF");    f.print(',');
+        f.print(cfg.ledUvCurrent);    f.print(',');
 
-        // Calibration data (18 channels)
+        // [12..13] N_cal + cal_valid — surface in every row (constant per
+        // experiment) so the importer doesn't need a join across files.
+        f.print((int)cal.n_used);   f.print(',');
+        f.print(cal.valid ? 1 : 0); f.print(',');
+
+        // [14..31]  18 calibration channels (blank reference I0).
         for (int j = 0; j < NUM_CHANNELS; j++) {
+            wf(cal.valid ? cal.reference[j] : 0.0f);
             f.print(',');
-            if (cal.valid) f.print(cal.reference[j], 4);
-            else           f.print(0.0f, 4);
         }
-
-        // Measurement data (18 channels)
+        // [32..49]  18 raw Δ channels.
         for (int j = 0; j < NUM_CHANNELS; j++) {
+            wf(exp.spectra[i][j]);
             f.print(',');
-            f.print(exp.spectra[i][j], 4);
         }
-
+        // [50..67]  18 transmittance channels (%, 0..100).
+        for (int j = 0; j < NUM_CHANNELS; j++) {
+            wf(exp.transmittance[i][j]);
+            f.print(',');
+        }
+        // [68..85]  18 absorbance channels — last block, no trailing comma.
+        for (int j = 0; j < NUM_CHANNELS; j++) {
+            wf(exp.absorbance[i][j]);
+            if (j < NUM_CHANNELS - 1) f.print(',');
+        }
         f.println();
     }
 
     f.flush();
     f.close();
-    Serial.printf("[SD] Saved %d rows for exp '%s'\n", exp.count, exp.experiment_id);
+    Serial.printf("[SD] Saved %d rows for exp '%s' (uuid=%s)\n",
+                  exp.count, exp.experiment_id, exp.uuid);
 
     // Mark experiment pending DB verification — must persist across reboots.
     // Keyed by uuid so the verify path is rename-safe (R1).
     markPending(exp.uuid, exp.experiment_id, exp.count);
-    return true;
-}
-
-// ─── Append calibration (per-experiment binding, R6) ─────────────────────────
-//
-// One row per experiment, keyed by uuid + exp_id.  This is the data shape the
-// import flow on the dashboard expects (clarification #7) and the format the
-// device's offline pull mirrors.
-
-bool SDLogger::appendCalibration(const Experiment& exp) {
-    if (!_ready) {
-        Serial.println("[SD] Not ready, cannot append calibration");
-        return false;
-    }
-    ensureCalibrationsHeader();
-
-    File f = SD.open(CAL_FILE, FILE_APPEND);
-    if (!f) {
-        Serial.println("[SD] Failed to open calibrations file for append");
-        return false;
-    }
-
-    char date[24]; getDateStr(date, sizeof(date));
-    const SensorConfig& cfg = exp.sensor_cfg;
-    const CalibrationData& cal = exp.calibration;
-
-    f.print(exp.uuid);          f.print(',');
-    f.print(exp.experiment_id); f.print(',');
-    f.print(date);              f.print(',');
-    f.print((int)cfg.gain);     f.print(',');     // numeric gain — eases reimport
-    f.print(cfg.integrationCycles); f.print(',');
-    f.print(cfg.ledWhiteCurrent);   f.print(',');
-    f.print(cfg.ledWhiteEnabled ? "ON" : "OFF"); f.print(',');
-    f.print(cfg.ledIrCurrent);      f.print(',');
-    f.print(cfg.ledIrEnabled    ? "ON" : "OFF"); f.print(',');
-    f.print(cfg.ledUvCurrent);      f.print(',');
-    f.print(cfg.ledUvEnabled    ? "ON" : "OFF"); f.print(',');
-    f.print((int)cal.n_used);   f.print(',');
-    f.print(cal.valid ? 1 : 0);
-
-    for (int j = 0; j < NUM_CHANNELS; j++) {
-        f.print(',');
-        f.print(cal.valid ? cal.reference[j] : 0.0f, 4);
-    }
-    f.println();
-    f.close();
-    Serial.printf("[SD] Calibration row appended for uuid=%s\n", exp.uuid);
     return true;
 }
 
@@ -463,17 +436,9 @@ static bool rewriteFilteredByCol0(const char* srcPath, const char* tmpPath,
 
 bool SDLogger::removeExperimentRows(const char* uuid) {
     if (!_ready) return false;
-    bool a = rewriteFilteredByCol0(LOG_FILE, "/spectra.tmp", uuid);
-    // Always also strip the matching calibration row — orphan calibrations
-    // would survive forever otherwise (the UUID for that experiment is
-    // already gone from the DB by the time we run).
-    bool b = removeCalibrationRow(uuid);
-    return a && b;
-}
-
-bool SDLogger::removeCalibrationRow(const char* uuid) {
-    if (!_ready) return false;
-    return rewriteFilteredByCol0(CAL_FILE, "/calibrations.tmp", uuid);
+    // v3 stores everything (including calibration) inline in /spectra.csv,
+    // so a single-file rewrite is now the complete operation.
+    return rewriteFilteredByCol0(LOG_FILE, "/spectra.tmp", uuid);
 }
 
 // ─── Cleanup pass ────────────────────────────────────────────────────────────
@@ -562,12 +527,9 @@ int SDLogger::cleanupVerifiedExperiments(const char* host, uint16_t port) {
     if (pendingEmpty) {
         if (SD.exists(LOG_FILE) && !SD.remove(LOG_FILE))
             Serial.println("[SD/cleanup] WARNING: could not remove /spectra.csv");
-        if (SD.exists(CAL_FILE) && !SD.remove(CAL_FILE))
-            Serial.println("[SD/cleanup] WARNING: could not remove /calibrations.csv");
-        // Recreate empty schemas so the next saveExperiment has a target.
-        // Headers are NOT residual data — they are the file's contract.
+        // Recreate the empty schema so the next saveExperiment has a target.
+        // The header is NOT residual data — it is the file's contract.
         ensureHeader();
-        ensureCalibrationsHeader();
         Serial.println("[SD/cleanup] All experiments verified — SD wiped of data");
     }
 

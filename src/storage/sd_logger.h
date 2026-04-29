@@ -7,11 +7,13 @@
 #define SD_MOSI_PIN 23
 #define SD_MISO_PIN 19
 #define SD_SCK_PIN  18
+// Single consolidated experiment file.  One row per measurement, all data
+// bound to the row: experiment metadata + calibration vector + raw Δ +
+// transmittance % + absorbance.  No companion file — calibration travels
+// inline so the file is self-contained and parseable in one pass.  An
+// "archive" (= the raw /spectra.csv) can hold 1..N experiments, grouped by
+// uuid.  Bridge and importer ingest that same shape.
 #define LOG_FILE    "/spectra.csv"
-// Per-experiment append-only calibration file, keyed by uuid.  The previous
-// /calibration.csv was a single overwriting file — fundamentally incompatible
-// with R6 (every experiment binds its own calibration explicitly).  Removed.
-#define CAL_FILE    "/calibrations.csv"
 #define PENDING_DIR "/pending"
 
 // HTTP verify retry policy (applied per pending experiment per cleanup pass)
@@ -24,16 +26,11 @@ public:
     bool begin();
     bool isReady() const;
 
-    // Save full experiment to SD (APPENDS CSV rows — never truncates).
+    // Save full experiment to SD (APPENDS rows — never truncates).
+    // Each row carries: metadata + 18 cal + 18 raw Δ + 18 T% + 18 A.
     // On success, also writes a pending flag file so the data can later be
-    // verified against the DB and deleted from SD.  ALSO appends one
-    // matching row to /calibrations.csv keyed by exp.uuid (R6).
+    // verified against the DB and deleted from SD.
     bool saveExperiment(const Experiment& exp);
-
-    // Append one calibration row, keyed by uuid + exp_id.  No overwriting:
-    // the file accumulates one row per experiment so the device can ship
-    // its full SD layout to the dashboard for manual import (issue #8).
-    bool appendCalibration(const Experiment& exp);
 
     // Write CSV header if file is new or empty
     bool ensureHeader();
@@ -50,9 +47,7 @@ public:
                           const char* host, uint16_t port);
 
     // Rewrite LOG_FILE excluding rows whose uuid (CSV column 0) matches.
-    // Atomic: writes to LOG_FILE + ".tmp" then renames on success.  Also
-    // strips the matching uuid from /calibrations.csv so the SD layout
-    // stays consistent (no orphan calibration row pointing at deleted data).
+    // Atomic: writes to LOG_FILE + ".tmp" then renames on success.
     bool removeExperimentRows(const char* uuid);
 
     // Iterate PENDING_DIR, verify each experiment with the server, and on
@@ -70,9 +65,6 @@ private:
                          char* uuidOut, size_t uuidLen,
                          char* expIdOut, size_t expIdLen,
                          int* expectedOut);
-    // Strip rows from /calibrations.csv where uuid column matches.  Same
-    // atomic-rewrite contract as removeExperimentRows().
-    bool removeCalibrationRow(const char* uuid);
 };
 
 extern SDLogger g_sdLogger;

@@ -2,11 +2,70 @@ import csv
 import io
 import json
 import os
+import secrets
+from datetime import timedelta
+from functools import wraps
 
 import flask
 import mysql.connector
+from markupsafe import escape
 
 app = flask.Flask(__name__)
+
+# ─── Auth configuration ─────────────────────────────────────────────────────
+# Session-cookie auth gates the dashboard.  The ESP32 keeps its own token-only
+# path on /verify since it cannot hold a cookie across reboots.
+LOGIN_USERNAME    = os.getenv("LOGIN_USERNAME",    "")
+LOGIN_PASSWORD    = os.getenv("LOGIN_PASSWORD",    "")
+FLASK_SECRET_KEY  = os.getenv("FLASK_SECRET_KEY",  "")
+SESSION_HOURS     = int(os.getenv("SESSION_HOURS", "12"))
+COOKIE_SECURE     = os.getenv("SESSION_COOKIE_SECURE", "0") == "1"
+
+# /verify (ESP32 only) — kept distinct in name to make the eventual split into
+# DEVICE_VERIFY_TOKEN obvious.  Today it equals the value the firmware already
+# carries in mqtt_credentials.h (FLASK_API_KEY).
+API_KEY = os.getenv("API_KEY", "")
+
+# Fail loud, not silent — a missing secret_key produces working logins that all
+# share the same default-empty signing key, which would let an attacker forge a
+# session cookie.
+if not FLASK_SECRET_KEY:
+    raise RuntimeError(
+        "FLASK_SECRET_KEY is not set. Generate one (e.g. `python -c "
+        "\"import secrets; print(secrets.token_hex(32))\"`) and put it in docker/.env"
+    )
+if not LOGIN_USERNAME or not LOGIN_PASSWORD:
+    raise RuntimeError(
+        "LOGIN_USERNAME and LOGIN_PASSWORD must be set in docker/.env "
+        "before the dashboard can start."
+    )
+
+app.secret_key = FLASK_SECRET_KEY
+app.permanent_session_lifetime = timedelta(hours=SESSION_HOURS)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY = True,
+    SESSION_COOKIE_SAMESITE = "Lax",   # allows top-level GET nav, blocks cross-site POST
+    SESSION_COOKIE_SECURE   = COOKIE_SECURE,
+)
+
+def _is_logged_in():
+    return flask.session.get("user") == LOGIN_USERNAME
+
+def require_login(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not _is_logged_in():
+            # XHR (fetch) gets JSON 401 — the dashboard's apiFetch wrapper
+            # turns that into a redirect to /login.  Plain navigation
+            # (window.location, <a href>, file downloads) gets a 302 so the
+            # browser lands on the login page directly.
+            accept = flask.request.headers.get("Accept", "")
+            wants_html = "text/html" in accept and "application/json" not in accept
+            if wants_html:
+                return flask.redirect(flask.url_for("login_page"))
+            return flask.jsonify({"error": "unauthorized"}), 401
+        return f(*args, **kwargs)
+    return decorated
 
 DB_CONFIG = {
     "host":     os.getenv("MYSQL_HOST",     "localhost"),
@@ -14,6 +73,11 @@ DB_CONFIG = {
     "password": os.getenv("MYSQL_PASSWORD", ""),
     "database": os.getenv("MYSQL_DATABASE", "espectrografo"),
 }
+
+# Where the browser must reach the broker over WebSockets.  Templated into
+# control.html at /; not a secret, just deploy-specific.
+MQTT_PUBLIC_HOST    = os.getenv("MQTT_PUBLIC_HOST",    "localhost")
+MQTT_PUBLIC_WS_PORT = int(os.getenv("MQTT_PUBLIC_WS_PORT", "9001"))
 
 WAVELENGTHS = [410, 435, 460, 485, 510, 535, 560, 585, 610,
                645, 680, 705, 730, 760, 810, 860, 900, 940]
@@ -24,18 +88,109 @@ def get_db():
 
 @app.after_request
 def add_cors(response):
+    # Cookie-auth is same-origin only (we don't set Allow-Credentials), so
+    # this header only matters for cross-origin GETs to public endpoints.
     response.headers["Access-Control-Allow-Origin"]  = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return response
 
+# ─── Auth pages ─────────────────────────────────────────────────────────────
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Sign in &mdash; Spectrograph</title>
+<style>
+:root{--bg:#0f172a;--card:#1e293b;--bdr:#334155;--accent:#38bdf8;
+  --text:#e2e8f0;--muted:#94a3b8;--danger:#f87171}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);
+  min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1rem}
+.card{background:var(--card);border:1px solid var(--bdr);border-radius:.7rem;
+  padding:1.5rem 1.5rem 1.7rem;width:100%;max-width:340px}
+h1{color:var(--accent);font-size:1.05rem;margin-bottom:1rem;text-align:center;letter-spacing:.05em}
+label{display:block;font-size:.72rem;color:var(--muted);margin:.65rem 0 .2rem}
+input{width:100%;padding:.45rem .55rem;background:var(--bg);border:1px solid var(--bdr);
+  border-radius:.3rem;color:var(--text);font-size:.85rem;font-family:inherit}
+input:focus{outline:none;border-color:var(--accent)}
+button{width:100%;padding:.55rem;margin-top:1.1rem;border:none;border-radius:.3rem;
+  background:var(--accent);color:var(--bg);font-size:.82rem;font-weight:700;cursor:pointer;
+  letter-spacing:.04em}
+button:hover{opacity:.85}
+.err{margin-top:.85rem;padding:.4rem;background:var(--danger);color:var(--bg);
+  border-radius:.3rem;font-size:.72rem;text-align:center;font-weight:600}
+.muted{margin-top:.9rem;color:var(--muted);font-size:.65rem;text-align:center}
+</style>
+</head>
+<body>
+<form class="card" method="POST" action="/login">
+  <h1>Spectrograph &mdash; Sign in</h1>
+  <label for="u">Username</label>
+  <input id="u" name="username" autocomplete="username" required autofocus/>
+  <label for="p">Password</label>
+  <input id="p" name="password" type="password" autocomplete="current-password" required/>
+  <button type="submit">Sign in</button>
+  __ERROR__
+  <div class="muted">AS7265X spectrograph &middot; restricted access</div>
+</form>
+</body>
+</html>"""
+
+def _render_login(error=None):
+    block = (f'<div class="err">{escape(error)}</div>'
+             if error else "")
+    return LOGIN_HTML.replace("__ERROR__", block)
+
+@app.route("/login", methods=["GET"])
+def login_page():
+    if _is_logged_in():
+        return flask.redirect("/")
+    return _render_login()
+
+@app.route("/login", methods=["POST"])
+def login_submit():
+    u = (flask.request.form.get("username") or "").strip()
+    p = flask.request.form.get("password") or ""
+    # Constant-time compare on both fields so a wrong username and a wrong
+    # password take the same time — denies username enumeration via timing.
+    ok_u = secrets.compare_digest(u.encode(),       LOGIN_USERNAME.encode())
+    ok_p = secrets.compare_digest(p.encode(),       LOGIN_PASSWORD.encode())
+    if ok_u and ok_p:
+        flask.session.clear()                # rotate session id on auth success
+        flask.session["user"] = LOGIN_USERNAME
+        flask.session.permanent = True       # honour permanent_session_lifetime
+        return flask.redirect("/")
+    return _render_login("Invalid credentials"), 401
+
+@app.route("/logout", methods=["POST", "GET"])
+def logout():
+    flask.session.clear()
+    return flask.redirect(flask.url_for("login_page"))
+
+# ─── Dashboard ──────────────────────────────────────────────────────────────
+
 @app.route("/")
 def serve_html():
+    if not _is_logged_in():
+        return flask.redirect(flask.url_for("login_page"))
     with open("control.html", "r", encoding="utf-8") as f:
-        return f.read()
+        html = f.read()
+    # Inject deploy-time broker host/port so control.html stays generic.
+    # Both literals must match the source exactly — see lines 329-330 there.
+    html = html.replace(
+        'var MQTT_HOST = "localhost";',
+        f'var MQTT_HOST = {json.dumps(MQTT_PUBLIC_HOST)};',
+    ).replace(
+        'var MQTT_PORT = 9001;',
+        f'var MQTT_PORT = {MQTT_PUBLIC_WS_PORT};',
+    )
+    return html
 
-# ─── Experiments listing ────────────────────────────────────────────────────
 @app.route("/history/experiments", methods=["GET"])
+@require_login
 def get_experiments():
     limit  = min(int(flask.request.args.get("limit", 50)), 500)
     offset = int(flask.request.args.get("offset", 0))
@@ -58,7 +213,6 @@ def get_experiments():
     finally:
         cur.close(); db.close()
 
-# ─── Per-experiment fetch (R6: every dataset returns its own calibration) ───
 def _fetch_channels(cur, table, uuid):
     cur.execute(
         f"SELECT * FROM {table} WHERE uuid=%s ORDER BY meas_index", (uuid,)
@@ -67,13 +221,9 @@ def _fetch_channels(cur, table, uuid):
             for r in cur.fetchall()]
 
 @app.route("/history/spectra", methods=["GET"])
+@require_login
 def get_spectra():
-    """Returns Δ-counts + per-experiment calibration + the experiment row.
-    The dashboard derives transmittance for live display, but for historical
-    plots prefers /history/transmittance and /history/absorbance below."""
     uuid = flask.request.args.get("uuid", "")
-    # Backward-compat: accept exp_id when the dashboard hasn't been told
-    # about UUIDs yet — pick the most recent experiment with that label.
     if not uuid and flask.request.args.get("exp_id"):
         db = get_db(); cur = db.cursor(dictionary=True)
         cur.execute(
@@ -105,14 +255,14 @@ def get_spectra():
             exp["timestamp_ms"] = int(exp["timestamp_ms"])
 
         return flask.jsonify({
-            "uuid":            uuid,
-            "exp_id":          exp.get("exp_id"),
-            "experiment":      exp,           # full config row → drives the table
-            "wavelengths":     WAVELENGTHS,
-            "offsets":         offsets,
-            "spectra":         spectra,       # raw Δ counts
-            "transmittance":   trans,         # processed by ESP32, % units
-            "absorbance":      absorb,        # processed by ESP32, a.u.
+            "uuid":             uuid,
+            "exp_id":           exp.get("exp_id"),
+            "experiment":       exp,
+            "wavelengths":      WAVELENGTHS,
+            "offsets":          offsets,
+            "spectra":          spectra,
+            "transmittance":    trans,
+            "absorbance":       absorb,
             "num_measurements": len(spectra),
         })
     except Exception as ex:
@@ -120,12 +270,13 @@ def get_spectra():
     finally:
         cur.close(); db.close()
 
-# ─── Targeted T / A endpoints ───────────────────────────────────────────────
 @app.route("/history/transmittance", methods=["GET"])
+@require_login
 def get_transmittance():
     return _table_endpoint("transmittances")
 
 @app.route("/history/absorbance", methods=["GET"])
+@require_login
 def get_absorbance():
     return _table_endpoint("absorbancias")
 
@@ -140,9 +291,8 @@ def _table_endpoint(table):
     finally:
         cur.close(); db.close()
 
-# ─── Manual delete (issue #8.A) ─────────────────────────────────────────────
-# ON DELETE CASCADE in the schema removes mediciones/calibraciones/T/A rows.
 @app.route("/experiments/<uuid>", methods=["DELETE"])
+@require_login
 def delete_experiment(uuid):
     db = get_db(); cur = db.cursor()
     try:
@@ -156,18 +306,8 @@ def delete_experiment(uuid):
     finally:
         cur.close(); db.close()
 
-# ─── Manual import (issue #8.B) ─────────────────────────────────────────────
-# Single CSV file matching the device's v3 /spectra.csv schema (one row per
-# measurement, calibration inline).  An archive may carry 1..N experiments —
-# rows are grouped by `uuid` and inserted as separate experiments.  Each
-# experiment goes through the same store_experiment() path the MQTT bridge
-# uses, so the dashboard cannot tell device-uploaded from imported.
-#
-# Required columns (from sd_logger.cpp ensureHeader):
-#   uuid, exp_id, date, meas_idx, gain, int_cycles,
-#   white_led, white_mA, ir_led, ir_mA, uv_led, uv_mA, n_cal, cal_valid,
-#   cal_ch1..cal_ch18, ch1..ch18, t_ch1..t_ch18, a_ch1..a_ch18
 @app.route("/experiments/import", methods=["POST"])
+@require_login
 def import_experiment():
     upload = (flask.request.files.get("file")
               or flask.request.files.get("spectra")
@@ -192,9 +332,6 @@ def import_experiment():
             "hint": "file must match the device's /spectra.csv v3 schema",
         }), 400
 
-    # Group rows by uuid.  Order within a uuid follows the file order (which
-    # the device writes meas_idx-ordered) — we sort defensively in case the
-    # user hand-edited the CSV.
     by_uuid = {}
     for r in rows:
         uid = r.get("uuid", "").strip()
@@ -214,8 +351,6 @@ def import_experiment():
                 out.append(None)
         return out
 
-    # Gain may be stored either as the AS7265X enum integer (0..3) or as a
-    # human label ("16x").  Decode both.
     gain_label_to_int = {"1x": 0, "4x": 1, "16x": 2, "64x": 3}
     def _gain(v):
         s = str(v).strip()
@@ -270,12 +405,13 @@ def import_experiment():
     return flask.jsonify({"imported": imported, "errors": errors,
                           "total_uuids": len(by_uuid)}), status
 
-# ─── CSV / JSON export (legacy) ─────────────────────────────────────────────
 @app.route("/history/export/csv", methods=["GET"])
+@require_login
 def export_csv():
     return _export("csv")
 
 @app.route("/history/export/json", methods=["GET"])
+@require_login
 def export_json():
     return _export("json")
 
@@ -297,8 +433,6 @@ def _export(fmt):
         exps = cur.fetchall()
 
         if fmt == "csv":
-            # v3 layout — round-trippable through /experiments/import.
-            # Columns mirror sd_logger.cpp ensureHeader exactly.
             gain_labels = ["1x", "4x", "16x", "64x"]
             out = io.StringIO(); w = csv.writer(out)
             header = (["uuid", "exp_id", "date", "meas_idx",
@@ -311,7 +445,6 @@ def _export(fmt):
                       + [f"a_ch{i}"   for i in range(1, NCH + 1)])
             w.writerow(header)
             for e in exps:
-                # Pull all four channel blocks for this experiment.
                 spectra = _fetch_channels(cur, "mediciones",     e["uuid"])
                 trans   = _fetch_channels(cur, "transmittances", e["uuid"])
                 absorb  = _fetch_channels(cur, "absorbancias",   e["uuid"])
@@ -323,15 +456,13 @@ def _export(fmt):
                 gain_lbl = gain_labels[e.get("gain", 0)] if 0 <= (e.get("gain") or 0) < 4 else str(e.get("gain"))
                 meta_prefix = [
                     e["uuid"], e.get("exp_id"), date,
-                    None,               # meas_idx — filled per row below
+                    None,
                     gain_lbl, e.get("int_cycles"),
                     "ON" if e.get("led_white_on") else "OFF", e.get("led_white_ma"),
                     "ON" if e.get("led_ir_on")    else "OFF", e.get("led_ir_ma"),
                     "ON" if e.get("led_uv_on")    else "OFF", e.get("led_uv_ma"),
                     e.get("n_cal"), 1 if e.get("cal_valid") else 0,
                 ]
-                # Pad missing T/A rows with [None]*NCH so the column count
-                # stays constant even if processing failed for some rows.
                 pad = lambda lst, idx: lst[idx] if idx < len(lst) else [None] * NCH
                 for i, raw in enumerate(spectra):
                     row = list(meta_prefix); row[3] = i
@@ -359,9 +490,12 @@ def _export(fmt):
     finally:
         cur.close(); db.close()
 
-# ─── /verify  used by the SD->DB cleanup pass on the ESP32 ──────────────────
 @app.route("/verify", methods=["GET"])
 def verify_experiment():
+    token = flask.request.args.get("token", "")
+    if API_KEY and token != API_KEY:
+        return flask.jsonify({"error": "unauthorized"}), 401
+
     uuid     = flask.request.args.get("uuid", "")
     exp_id   = flask.request.args.get("exp_id", "")
     expected = int(flask.request.args.get("expected", 0) or 0)
@@ -382,11 +516,11 @@ def verify_experiment():
             cur.execute("SELECT 1 FROM experimentos WHERE exp_id=%s", (exp_id,))
         registered = cur.fetchone() is not None
         return flask.jsonify({
-            "verified":    registered and expected > 0 and cnt >= expected,
-            "uuid":        uuid,
-            "exp_id":      exp_id,
-            "rows_found":  cnt,
-            "rows_expected": expected,
+            "verified":              registered and expected > 0 and cnt >= expected,
+            "uuid":                  uuid,
+            "exp_id":                exp_id,
+            "rows_found":            cnt,
+            "rows_expected":         expected,
             "experiment_registered": registered,
         })
     finally:

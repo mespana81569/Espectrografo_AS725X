@@ -20,13 +20,16 @@
 #include <PubSubClient.h>
 
 #include "../acquisition/measurement_engine.h"  // Experiment struct
+#include "mqtt_credentials.h"  // MQTT_BROKER_HOST, MQTT_USERNAME, MQTT_PASSWORD
 
 // ─── Broker configuration ───────────────────────────────────────────────────
 // PubSubClient expects a plain hostname (no scheme, no brackets).
-#define MQTT_BROKER_HOST   "192.168.1.59"
-//#define MQTT_BROKER_HOST   "cygnus.uniajc.edu.co"
+
 #define MQTT_BROKER_PORT   1883
 #define MQTT_CLIENT_ID     "espectrografo-01"
+// FLASK_API_KEY comes from mqtt_credentials.h (gitignored) — do NOT redefine
+// it here, it would either trigger a redefinition warning or shadow the real
+// gitignored value with whatever literal someone typed in this committed file.
 
 // ─── Topic names ────────────────────────────────────────────────────────────
 // Commands (subscribed) — control.html → ESP32

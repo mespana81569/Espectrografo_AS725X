@@ -202,9 +202,14 @@ def on_message(_client, _userdata, msg):
     elif topic == "esp32/data/status":
         print(f"[bridge] heartbeat state={data.get('state')} rssi={data.get('rssi')}")
 
+MQTT_USERNAME = os.getenv("MQTT_USERNAME", "")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
+
 if __name__ == "__main__":
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     client.on_connect = on_connect
     client.on_message = on_message
+    if MQTT_USERNAME:
+        client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
     client.connect(MQTT_BROKER, MQTT_PORT)
     client.loop_forever()

@@ -1,4 +1,5 @@
 #include "mqtt_client.h"
+#include "mqtt_credentials.h"  // MQTT_BROKER_HOST, MQTT_USERNAME, MQTT_PASSWORD
 
 #include <ArduinoJson.h>
 #include <SD.h>
@@ -9,6 +10,7 @@
 #include "../sensors/as7265x_driver.h"
 #include "../acquisition/calibration.h"
 #include "../storage/sd_logger.h"
+
 
 MqttClient  g_mqttClient;
 MqttClient* MqttClient::_instance = nullptr;
@@ -226,7 +228,7 @@ void MqttClient::tick() {
 bool MqttClient::attemptConnect() {
     Serial.printf("[MQTT] Connecting to %s:%u as %s...\n",
                   MQTT_BROKER_HOST, (unsigned)MQTT_BROKER_PORT, MQTT_CLIENT_ID);
-    bool ok = _client.connect(MQTT_CLIENT_ID);
+    bool ok = _client.connect(MQTT_CLIENT_ID,MQTT_USERNAME,MQTT_PASSWORD);
     if (!ok) {
         Serial.printf("[MQTT] connect() failed, rc=%d\n", _client.state());
     }

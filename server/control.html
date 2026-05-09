@@ -115,6 +115,7 @@
   <div class="seg"><span class="lab">RSSI:</span><span id="rssiTxt">--</span></div>
   <div class="seg"><span class="lab">Heap:</span><span id="heapTxt">--</span></div>
   <div class="seg"><span class="lab">Uploads:</span><span id="upTxt">0</span></div>
+  <div class="seg"><a href="#" onclick="doLogout(event)" style="color:var(--muted);text-decoration:none;font-size:.7rem">Sign out</a></div>
 </div>
 
 <div class="pipe" id="pipe">
@@ -329,6 +330,25 @@
 var MQTT_HOST = "localhost";
 var MQTT_PORT = 9001;
 var MQTT_CLIENT_ID = "control_" + Math.random().toString(16).substr(2,8);
+
+// Same-origin cookie auth: fetch() attaches the session cookie automatically.
+// On 401 (session expired or never logged in) redirect to /login so the user
+// re-authenticates instead of seeing a silently broken UI.  Replaces the
+// X-API-Key path that was retired when session login landed.
+function apiFetch(url, opts){
+  return fetch(url, opts).then(function(r){
+    if(r.status === 401){
+      window.location = '/login';
+      throw new Error('session expired');
+    }
+    return r;
+  });
+}
+
+function doLogout(ev){
+  if(ev) ev.preventDefault();
+  fetch('/logout', {method:'POST'}).finally(function(){ window.location = '/login'; });
+}
 
 var WAVELENGTHS = [410,435,460,485,510,535,560,585,610,645,680,705,730,760,810,860,900,940];
 
@@ -1066,7 +1086,7 @@ var pgOffset = 0, pgLimit = 50, pgTotal = 0;
 function loadExperiments(force){
   var spin=document.getElementById('expSpin');
   spin.classList.remove('hidden');
-  fetch('/history/experiments?limit='+pgLimit+'&offset='+pgOffset)
+  apiFetch('/history/experiments?limit='+pgLimit+'&offset='+pgOffset)
     .then(function(r){return r.json();})
     .then(function(j){
       cache.exp={data:j,ts:Date.now()};
@@ -1131,7 +1151,7 @@ function toggleSelectAll(on){
 function deleteOne(uuid, label){
   if(!uuid) return;
   if(!confirm('Delete experiment "'+label+'" ('+uuid.slice(0,8)+')?\n\nThis removes its measurements, calibration, transmittance and absorbance rows from the database.')) return;
-  fetch('/experiments/'+encodeURIComponent(uuid), {method:'DELETE'})
+  apiFetch('/experiments/'+encodeURIComponent(uuid), {method:'DELETE'})
     .then(function(r){ return r.json(); })
     .then(function(j){
       lg('Deleted '+(j.deleted||0)+' row(s) for '+uuid.slice(0,8));
@@ -1146,7 +1166,7 @@ function bulkDelete(){
   var uuids=[]; for(var i=0;i<ck.length;i++) uuids.push(ck[i].dataset.uuid);
   if(!confirm('Delete '+uuids.length+' experiment(s)?\n\n'+uuids.map(function(u){return u.slice(0,8);}).join(', '))) return;
   Promise.all(uuids.map(function(u){
-    return fetch('/experiments/'+encodeURIComponent(u), {method:'DELETE'}).then(function(r){return r.json();});
+    return apiFetch('/experiments/'+encodeURIComponent(u), {method:'DELETE'}).then(function(r){return r.json();});
   })).then(function(results){
     var n=0; for(var i=0;i<results.length;i++) n += (results[i].deleted||0);
     lg('Bulk delete: '+n+' row(s) removed');
@@ -1161,7 +1181,7 @@ function runImport(){
   var fd = new FormData();
   fd.append('file', f);
   msg.textContent='Uploading...';
-  fetch('/experiments/import', {method:'POST', body:fd})
+  apiFetch('/experiments/import', {method:'POST', body:fd})
     .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, status:r.status, j:j}; }); })
     .then(function(o){
       var j = o.j || {};
@@ -1197,7 +1217,7 @@ function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){retu
 function populateExpSelect(list){
   var rows = list || (cache.exp.data && cache.exp.data.experiments) || [];
   if(!list){
-    fetch('/history/experiments?limit=200&offset=0').then(function(r){return r.json();}).then(function(j){
+    apiFetch('/history/experiments?limit=200&offset=0').then(function(r){return r.json();}).then(function(j){
       populateExpSelect(j.experiments||[]);
     });
     return;
@@ -1249,7 +1269,7 @@ function loadSpectra(){
   // chart 1-for-1 so the user always sees the experiment they selected.
   var spin=document.getElementById('spvSpin');
   spin.classList.remove('hidden');
-  fetch('/history/spectra?uuid='+encodeURIComponent(uuid))
+  apiFetch('/history/spectra?uuid='+encodeURIComponent(uuid))
     .then(function(r){return r.json();})
     .then(function(j){
       cache.spv={data:j,ts:Date.now(),uuid:uuid,expId:j.exp_id};

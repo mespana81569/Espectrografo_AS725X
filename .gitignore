@@ -16,3 +16,5 @@ mysql-data/
 
 # Secrets
 docker/.env
+firmware/src/mqtt/mqtt_credentials.h
+firmware/DB_VERIFY_secrets.h

@@ -6,6 +6,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include "../mqtt/mqtt_credentials.h"  // FLASK_API_KEY
 
 SDLogger g_sdLogger;
 
@@ -352,6 +353,8 @@ bool SDLogger::verifyWithServer(const char* uuid, int expectedRows,
     url += uuid;
     url += "&expected=";
     url += expectedRows;
+    url += "&token=";
+    url += FLASK_API_KEY;
 
     for (int attempt = 1; attempt <= VERIFY_MAX_RETRIES; attempt++) {
         HTTPClient http;

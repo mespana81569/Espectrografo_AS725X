@@ -7,13 +7,13 @@
 #include "storage/sd_logger.h"
 #include "web/web_server.h"
 #include "mqtt/mqtt_client.h"
+#include "../DB_VERIFY_secrets.h"  // DB_VERIFY_HOST, DB_VERIFY_PORT
 
 // ── DB-side host/port for /verify cleanup pass ──────────────────────────────
 // The Flask service that exposes /verify lives on the same machine as the
 // MQTT broker (docker-compose stack).  Keep these aligned with mqtt_client.h
 // — if the broker host changes, this must too.
-#define DB_VERIFY_HOST "192.168.1.59"
-#define DB_VERIFY_PORT 5000
+
 
 // Period between SD → DB verification passes.  Each pass blocks for up to
 // ~15s per pending experiment (HTTPClient retries), so don't run it too

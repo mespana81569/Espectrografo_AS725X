@@ -6,8 +6,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
-#include "../mqtt/mqtt_credentials.h"  // FLASK_API_KEY
-
+#include "../secrets.h"  // Flask key
 SDLogger g_sdLogger;
 
 static SPIClass sdSPI(VSPI);

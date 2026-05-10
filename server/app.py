@@ -178,14 +178,21 @@ def serve_html():
         return flask.redirect(flask.url_for("login_page"))
     with open("control.html", "r", encoding="utf-8") as f:
         html = f.read()
-    # Inject deploy-time broker host/port so control.html stays generic.
-    # Both literals must match the source exactly — see lines 329-330 there.
+    
+    mqtt_user = os.getenv("MQTT_USERNAME", "")
+    mqtt_pass = os.getenv("MQTT_PASSWORD", "")
+    
     html = html.replace(
         'var MQTT_HOST = "localhost";',
         f'var MQTT_HOST = {json.dumps(MQTT_PUBLIC_HOST)};',
     ).replace(
         'var MQTT_PORT = 9001;',
         f'var MQTT_PORT = {MQTT_PUBLIC_WS_PORT};',
+    ).replace(
+        'var MQTT_CLIENT_ID = "control_"',
+        f'var MQTT_USER = {json.dumps(mqtt_user)};\n'
+        f'var MQTT_PASS = {json.dumps(mqtt_pass)};\n'
+        f'var MQTT_CLIENT_ID = "control_"',
     )
     return html
 

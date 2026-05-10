@@ -336,6 +336,8 @@ var MQTT_CLIENT_ID = "control_" + Math.random().toString(16).substr(2,8);
 // re-authenticates instead of seeing a silently broken UI.  Replaces the
 // X-API-Key path that was retired when session login landed.
 function apiFetch(url, opts){
+  opts = opts || {};
+  opts.credentials = 'same-origin';
   return fetch(url, opts).then(function(r){
     if(r.status === 401){
       window.location = '/login';
@@ -404,12 +406,17 @@ function connectMQTT(){
       scheduleReconnect();
     };
     client.onMessageArrived = onMqttMessage;
-    client.connect({
+    var connOpts = {
       onSuccess: onMQTTConnect,
       useSSL: false,
       onFailure: onMQTTFail,
       keepAliveInterval: 30
-    });
+    };
+    if(typeof MQTT_USER !== 'undefined' && MQTT_USER){
+      connOpts.userName = MQTT_USER;
+      connOpts.password = MQTT_PASS;
+    }
+    client.connect(connOpts);
   }catch(e){
     lg('MQTT connect error: '+e.message);
     scheduleReconnect();

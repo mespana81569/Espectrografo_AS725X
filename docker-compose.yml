@@ -57,8 +57,7 @@
       MYSQL_USER: root
       MQTT_BROKER: mosquitto
       MQTT_PORT: 1883
-      MQTT_USERNAME: ${MQTT_USERNAME}
-      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      
     depends_on:
       mysql:
         condition: service_healthy

@@ -7,7 +7,7 @@
 #include "storage/sd_logger.h"
 #include "web/web_server.h"
 #include "mqtt/mqtt_client.h"
-#include "../DB_VERIFY_secrets.h"  // DB_VERIFY_HOST, DB_VERIFY_PORT
+#include "../secrets.h"  // DB_VERIFY_HOST, DB_VERIFY_PORT
 
 // ── DB-side host/port for /verify cleanup pass ──────────────────────────────
 // The Flask service that exposes /verify lives on the same machine as the
@@ -111,7 +111,7 @@ void loop() {
         unsigned long now = millis();
         if (now - s_lastCleanupMs >= CLEANUP_INTERVAL_MS) {
             s_lastCleanupMs = now;
-            g_sdLogger.cleanupVerifiedExperiments(DB_VERIFY_HOST, DB_VERIFY_PORT);
+            g_sdLogger.cleanupVerifiedExperiments(HOST, DB_VERIFY_PORT);
         }
     }
 }

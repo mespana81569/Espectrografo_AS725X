@@ -20,7 +20,7 @@
 #include <PubSubClient.h>
 
 #include "../acquisition/measurement_engine.h"  // Experiment struct
-#include "mqtt_credentials.h"  // MQTT_BROKER_HOST, MQTT_USERNAME, MQTT_PASSWORD
+#include "../secrets.h"  // MQTT_BROKER_HOST, MQTT_USERNAME, MQTT_PASSWORD
 
 // ─── Broker configuration ───────────────────────────────────────────────────
 // PubSubClient expects a plain hostname (no scheme, no brackets).

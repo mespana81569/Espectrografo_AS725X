@@ -17,4 +17,4 @@ mysql-data/
 
 # Secrets
 docker/.env
-firmware/src/.secrets.h
+firmware/secrets.h

@@ -2,7 +2,6 @@
 .pio/
 .pioenvs/
 
-
 # VSCode
 .vscode/
 
@@ -18,3 +17,5 @@ mysql-data/
 # Secrets
 docker/.env
 firmware/secrets.h
+firmware/src/mqtt/mqtt_credentials.h
+docker/mosquitto/passwd

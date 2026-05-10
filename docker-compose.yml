@@ -1,4 +1,4 @@
-﻿services:
+services:
   mosquitto:
     image: eclipse-mosquitto:2.0
     container_name: espectrografo_mqtt
@@ -16,8 +16,19 @@
     image: mysql:8.4
     container_name: espectrografo_db
     env_file: ./docker/.env
+    # 3306 is reachable only on the docker bridge network — never published
+    # to the host.  Flask + mqtt_bridge connect via the service name `mysql`.
     expose:
-      - "3306"          # solo accesible dentro de la red Docker
+      - "3306"
+    # Tuned for the 512 MB DigitalOcean droplet that runs production.  The
+    # default mysql:8.4 buffer pool is 128 MB and performance_schema reserves
+    # ~400 MB of address space at startup, both of which OOM the box.  Raise
+    # the limits later if you migrate to a larger host.
+    command: >
+      --innodb-buffer-pool-size=64M
+      --innodb-log-buffer-size=8M
+      --max-connections=20
+      --performance-schema=OFF
     volumes:
       - mysql_data:/var/lib/mysql
       - ./docker/mysql-init:/docker-entrypoint-initdb.d
@@ -38,7 +49,10 @@
     env_file: ./docker/.env
     environment:
       MYSQL_HOST: mysql
-      MYSQL_USER: root
+      # MySQL 8 default ACL refuses root@<any-host>; we use the dedicated
+      # account the mysql:8.4 image creates from MYSQL_USER/MYSQL_PASSWORD on
+      # first init (privileges scoped to MYSQL_DATABASE).
+      MYSQL_USER: espectrografo_user
     volumes:
       - ./server:/app
     depends_on:
@@ -54,10 +68,9 @@
     env_file: ./docker/.env
     environment:
       MYSQL_HOST: mysql
-      MYSQL_USER: root
+      MYSQL_USER: espectrografo_user
       MQTT_BROKER: mosquitto
       MQTT_PORT: 1883
-      
     depends_on:
       mysql:
         condition: service_healthy

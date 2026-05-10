@@ -135,17 +135,26 @@ IDLE → LIVE_MONITOR → IDLE
 
 ### Broker
 
-Configured in [src/mqtt/mqtt_client.h](src/mqtt/mqtt_client.h):
+Broker host + credentials live in `firmware/secrets.h` (gitignored — copy from
+[firmware/secretsExample.h](firmware/secretsExample.h)) and are pulled into
+[firmware/src/mqtt/mqtt_client.h](firmware/src/mqtt/mqtt_client.h) via
+`#include "../secrets.h"`:
 
 ```
-MQTT_BROKER_HOST  "192.168.1.59"        // LAN dev broker
-// MQTT_BROKER_HOST "cygnus.uniajc.edu.co"  // production (commented)
-MQTT_BROKER_PORT  1883
-MQTT_CLIENT_ID    "espectrografo-01"
-MQTT_MAX_PACKET_SIZE 16384              // raised from 4096 — see header comment
+HOST              "<public IP or domain>"  // shared with /verify (Flask)
+MQTT_USERNAME     "espectrografo"           // matches docker/mosquitto/passwd
+MQTT_PASSWORD     "<from docker/.env>"
+FLASK_API_KEY     "<matches docker/.env API_KEY>"
+
+// In mqtt_client.h:
+MQTT_BROKER_PORT       1883
+MQTT_CLIENT_ID         "espectrografo-01"
+MQTT_MAX_PACKET_SIZE   16384  // raised from 4096 — see header comment
 ```
 
 `MQTT_MAX_PACKET_SIZE` was raised because a 20-measurement experiment JSON ≈ 6 KB; the previous 4 KB limit caused `publish()` to silently return false.
+
+`MqttClient::attemptConnect()` calls `_client.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD)` so the broker can enforce `allow_anonymous false` (see [docker/mosquitto.conf](docker/mosquitto.conf)).
 
 ### Topics
 
@@ -310,7 +319,9 @@ The "save" path is *not* delete-after-publish. SD removal is gated on **server-s
    - `clearPending(uuid)` deletes the flag.
 5. After the last pending flag clears, the loop also wipes `/spectra.csv` so the SD has no residual data.
 
-`DB_VERIFY_HOST = "192.168.1.59"`, `DB_VERIFY_PORT = 5000` in [src/main.cpp](src/main.cpp) — must align with the MQTT broker host (same docker host).
+`HOST` and `DB_VERIFY_PORT` (5000) come from `firmware/secrets.h` and are read in [firmware/src/main.cpp](firmware/src/main.cpp) — `HOST` is shared with the MQTT broker, so the Flask `/verify` endpoint and the broker must run on the same docker host.
+
+The `/verify` request appends `&token=<FLASK_API_KEY>` so an unauthenticated client can't poll the experiment cardinality. The token is the same `API_KEY` env var the Flask container reads — keep them aligned.
 
 ## Hardware Pins
 
@@ -436,9 +447,29 @@ docker compose down -v          # stop + wipe mysql_data volume (re-runs init.sq
 
 ### Config files
 
-- [docker/mosquitto.conf](docker/mosquitto.conf) — two listeners, `allow_anonymous true`. **Must be UTF-8 without BOM** (Notepad will break this).
-- [docker/.env](docker/.env) — `MYSQL_ROOT_PASSWORD`, `MYSQL_PASSWORD` (must match), `MYSQL_DATABASE`, `MQTT_BROKER`, `MQTT_PORT`.
-- [docker/mysql-init/init.sql](docker/mysql-init/init.sql) — creates `experimentos`, `mediciones`, `calibraciones`. Only runs when `mysql_data` volume is empty.
+- [docker/mosquitto.conf](docker/mosquitto.conf) — two listeners (1883 TCP, 9001 WebSockets), `allow_anonymous false`, reads `password_file /mosquitto/config/passwd`. **Must be UTF-8 without BOM** (Notepad will break this). The `passwd` file is gitignored — generate it with `mosquitto_passwd -c -b ./docker/mosquitto/passwd <user> <password>`.
+- [docker/.env](docker/.env) — gitignored. Copy from [docker/.env.example](docker/.env.example) and fill in. Carries DB credentials, MQTT broker auth, the ESP32 `/verify` token, the Flask session secret + dashboard login, and the public MQTT host the browser uses for WebSockets.
+- [docker/mysql-init/init.sql](docker/mysql-init/init.sql) — creates the schema (`experimentos`, `mediciones`, `calibraciones`, `transmittances`, `absorbancias`). Only runs when `mysql_data` volume is empty. Does NOT create users — the mysql:8.4 image auto-provisions `MYSQL_USER`/`MYSQL_PASSWORD` from `.env` with privileges scoped to `MYSQL_DATABASE`.
+
+### Auth model
+
+| Surface | Mechanism | Source of truth |
+|---|---|---|
+| Dashboard pages (`/`, `/history/*`, `/experiments/*`) | Flask session cookie (HMAC-signed via `FLASK_SECRET_KEY`, `SameSite=Lax`, `HttpOnly`) | `LOGIN_USERNAME` / `LOGIN_PASSWORD` in `docker/.env`; compared with `secrets.compare_digest` |
+| Dashboard XHR (`apiFetch`) | Same cookie, sent via `credentials: 'same-origin'`; on 401 the wrapper redirects to `/login` | as above |
+| Mosquitto (TCP 1883 + WS 9001) | username/password from `mosquitto_passwd` file | `docker/mosquitto/passwd`, generated locally |
+| ESP32 `/verify` endpoint | `?token=<FLASK_API_KEY>` query param (cookie-less because the device can't hold a session) | `API_KEY` in `docker/.env`; `FLASK_API_KEY` in `firmware/secrets.h` — must be equal |
+
+`require_login` is dual-mode: returns a 302 to `/login` when `Accept: text/html` is present (browser navigation, file downloads), JSON 401 otherwise (XHR). `/verify` keeps token-only auth so the firmware doesn't need cookie support.
+
+`serve_html()` rewrites `control.html` at request time, injecting `MQTT_PUBLIC_HOST`, `MQTT_PUBLIC_WS_PORT`, `MQTT_USERNAME` and `MQTT_PASSWORD` into the page so the source file stays generic. The Paho JS client picks these up in `connectMQTT()` and authenticates against the broker.
+
+### Server constraints (production: 1 vCPU / 512 MB DigitalOcean droplet)
+
+- `mysql.command:` overrides `--innodb-buffer-pool-size=64M --innodb-log-buffer-size=8M --max-connections=20 --performance-schema=OFF`. Defaults OOM the box at startup.
+- The host needs ~1 GB of swap (`fallocate -l 1G /swapfile && mkswap && swapon`) for image pulls and the mysql warm-up.
+- `mysql.ports` is replaced with `expose: ["3306"]` — port 3306 is reachable only on the docker bridge network. Flask + mqtt_bridge connect via the service name `mysql`.
+- `MYSQL_USER` for both flask and mqtt_bridge is `espectrografo_user` (NOT root). MySQL 8 refuses `root@<any-host>` by default ACL; the dedicated user is auto-created by the mysql image from `MYSQL_USER` / `MYSQL_PASSWORD` in `.env`.
 
 ### MySQL schema (`espectrografo` database)
 
@@ -479,18 +510,23 @@ CORS open (`Access-Control-Allow-Origin: *`).
 
 ### Remote UI — [server/control.html](server/control.html)
 
-Single-page HTML served by Flask. Connects to the MQTT broker over WebSockets via `paho-mqtt.js` (`MQTT_HOST`/`MQTT_PORT` constants in `control.html` — change `MQTT_HOST` from `localhost` if serving remotely). Sends control commands via `esp32/cmd/*` and renders live channel data, calibration progress, transmittance and absorbance plots.
+Single-page HTML served by Flask. The `MQTT_HOST` / `MQTT_PORT` literals in the source file are placeholders — `serve_html()` rewrites them at request time from the `MQTT_PUBLIC_HOST` / `MQTT_PUBLIC_WS_PORT` env vars, and prepends `MQTT_USER` / `MQTT_PASS` globals so the Paho client authenticates against the broker. `apiFetch()` wraps every dashboard XHR with `credentials: 'same-origin'` and redirects to `/login` on 401.
 
 ### Gotchas
 
 - **BOM in mosquitto.conf** — Windows Notepad writes UTF-8 with BOM; mosquitto fails with `Unknown configuration variable "listener"`. Re-save as UTF-8 (no BOM).
 - **Password env mismatch** — code reads `MYSQL_PASSWORD`; MySQL image only honors `MYSQL_ROOT_PASSWORD`. Both must be present and match. Changing `.env` after the data volume exists has no effect — use `docker compose down -v` to re-init.
 - **WebSocket listener** — browser MQTT requires `protocol websockets` on a distinct listener from the 1883 TCP one.
-- **`MQTT_PORT` default** — `mqtt_to_db.py` defaults to `1884`; docker-compose overrides to `1883`.
-- **Broker host coupling** — `MQTT_BROKER_HOST` (firmware) and `DB_VERIFY_HOST` (firmware) must point to the same machine that runs the docker stack. Update both together.
+- **`MQTT_PORT` default** — `mqtt_to_db.py` defaults to `1883` matching docker-compose; do not change.
+- **Broker host coupling** — `HOST` in `firmware/secrets.h` is shared by the MQTT broker AND the Flask `/verify` endpoint, so they must run on the same docker host. Update once.
+- **`docker/mosquitto/passwd` is gitignored** — the file must exist on the host before `docker compose up`, otherwise Docker creates an empty directory at that bind-mount path and mosquitto fails to start. Generate with `mosquitto_passwd -c -b ./docker/mosquitto/passwd <user> <password>`.
+- **Cookie session vs HTTPS** — `SESSION_COOKIE_SECURE=1` requires HTTPS. Behind plain HTTP the browser will silently drop the cookie and the user appears to log in then immediately get redirected back. Keep it `0` until you put nginx/Caddy in front.
+- **`FLASK_SECRET_KEY` empty/missing** — Flask refuses to start (RuntimeError on import). `LOGIN_USERNAME` / `LOGIN_PASSWORD` empty likewise — fail-loud is intentional, a default-empty key would let an attacker forge session cookies.
+- **MySQL 8 ACL** — `root@<any-host>` is refused by default. Both Flask and mqtt_bridge must connect with `MYSQL_USER=espectrografo_user`, which the mysql image auto-creates from `.env` on first init. Do not set `MYSQL_USER=root` in compose.
+- **512 MB host OOM** — without the `command:` tuning flags the mysql container is killed at startup. Without ~1 GB of swap, `docker compose up` may also OOM during image pull.
 
 ## Future Work
 
-- Production broker switchover: uncomment `cygnus.uniajc.edu.co` in `mqtt_client.h` and align `DB_VERIFY_HOST`.
+- HTTPS + `SESSION_COOKIE_SECURE=1`: front the stack with Caddy or nginx, set `MQTT_PUBLIC_HOST` to the domain, and switch the cookie flag.
 - Experiment ID auto-increment is handled in JavaScript after each successful save — no backend counter needed.
 - NTP is wired on STA connect; date column auto-corrects once the ESP32 reaches internet.
